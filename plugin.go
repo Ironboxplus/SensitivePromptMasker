@@ -8,7 +8,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-var cpaSensitivePluginVersion = "0.1.0"
+var cpaSensitivePluginVersion = "0.1.1"
 
 type sensitivePlugin struct {
 	engine *engine

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,7 +64,7 @@ func (e *engine) interceptBefore(ctx context.Context, request requestInterceptRe
 		Stage: "request.sanitized", Model: request.Model, SourceFormat: request.SourceFormat,
 		ToFormat: request.ToFormat, RequestID: requestKey(request.Metadata, request.Body, request.Model), Count: count,
 	})
-	return requestInterceptResponse{Body: body}, nil
+	return requestInterceptResponse{Headers: maskForwardedHost(request.Headers), Body: body}, nil
 }
 
 func (e *engine) interceptAfter(ctx context.Context, request requestInterceptRequest) (requestInterceptResponse, error) {
@@ -76,7 +77,9 @@ func (e *engine) interceptAfter(ctx context.Context, request requestInterceptReq
 		Stage: "request.sanitized", Model: request.Model, SourceFormat: request.SourceFormat,
 		ToFormat: request.ToFormat, RequestID: requestKey(request.Metadata, request.Body, request.Model), Count: count,
 	})
+	redactStarted := time.Now()
 	session, body, err := redactJSON(ctx, sanitized, e.cfg.Privacy, e.detector)
+	redactElapsed := time.Since(redactStarted)
 	if err != nil {
 		return requestInterceptResponse{}, err
 	}
@@ -91,9 +94,28 @@ func (e *engine) interceptAfter(ctx context.Context, request requestInterceptReq
 		emitActivity(ctx, activityEvent{
 			Stage: "request.redacted", Model: request.Model, SourceFormat: request.SourceFormat,
 			ToFormat: request.ToFormat, RequestID: requestKey(request.Metadata, sanitized, request.Model), Count: len(session.Mappings),
+			RuleCounts: session.ruleCountsSnapshot(), Elapsed: redactElapsed,
 		})
 	}
-	return requestInterceptResponse{Body: body}, nil
+	return requestInterceptResponse{Headers: maskForwardedHost(request.Headers), Body: body}, nil
+}
+
+func maskForwardedHost(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	masked := headers.Clone()
+	found := false
+	for key := range masked {
+		if strings.EqualFold(key, "X-Forwarded-Host") {
+			delete(masked, key)
+			found = true
+		}
+	}
+	if found {
+		masked.Set("X-Forwarded-Host", "api.anthropic.com")
+	}
+	return masked
 }
 
 func (e *engine) interceptResponse(request responseInterceptRequest) responseInterceptResponse {
@@ -103,11 +125,13 @@ func (e *engine) interceptResponse(request responseInterceptRequest) responseInt
 func (e *engine) interceptResponseContext(ctx context.Context, request responseInterceptRequest) responseInterceptResponse {
 	key := requestKey(request.Metadata, request.RequestBody, request.Model)
 	session := e.takeSession(key, true)
+	restoreStarted := time.Now()
 	body, count := restoreJSONBytes(request.Body, session)
+	restoreElapsed := time.Since(restoreStarted)
 	e.restoredMarkers.Add(uint64(count))
 	emitActivity(ctx, activityEvent{
 		Stage: "response.restored", Model: request.Model, SourceFormat: request.SourceFormat,
-		RequestID: key, Count: count,
+		RequestID: key, Count: count, Elapsed: restoreElapsed,
 	})
 	return responseInterceptResponse{Body: body}
 }
@@ -126,11 +150,13 @@ func (e *engine) interceptStreamContext(ctx context.Context, request streamChunk
 	if restorer == nil {
 		return streamChunkInterceptResponse{Body: request.Body}
 	}
+	restoreStarted := time.Now()
 	body, drop, count := restorer.feed(request.Body)
+	restoreElapsed := time.Since(restoreStarted)
 	e.restoredMarkers.Add(uint64(count))
 	emitActivity(ctx, activityEvent{
 		Stage: "response.restored", Model: request.Model, SourceFormat: request.SourceFormat,
-		RequestID: key, Count: count, Stream: true,
+		RequestID: key, Count: count, Stream: true, Elapsed: restoreElapsed,
 	})
 	if restorer != nil && restorer.streamTerminal(request.Body) {
 		e.mu.Lock()

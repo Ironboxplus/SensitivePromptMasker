@@ -3,18 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
-const markerPrefix = "CPA_RESTORE_SECRET_"
+const (
+	markerPrefix       = "CPA_S_"
+	legacyMarkerPrefix = "CPA_RESTORE_SECRET_"
+	markerLead         = "CPA_"
+)
+
+var markerEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 type finding struct {
 	Start       int
@@ -35,14 +43,23 @@ type mapping struct {
 }
 
 type privacySession struct {
-	Mappings []mapping
-	byKey    map[string]string
-	nonce    [16]byte
+	Mappings     []mapping
+	byKey        map[string]string
+	byMarker     map[string]mapping
+	markerKeys   map[string]string
+	RuleCounts   map[string]int
+	maxMarkerLen int
+	indexMu      sync.Mutex
+	indexReady   atomic.Bool
 }
 
 func newPrivacySession() *privacySession {
-	session := &privacySession{byKey: make(map[string]string)}
-	_, _ = rand.Read(session.nonce[:])
+	session := &privacySession{
+		byKey:      make(map[string]string),
+		byMarker:   make(map[string]mapping),
+		markerKeys: make(map[string]string),
+		RuleCounts: make(map[string]int),
+	}
 	return session
 }
 
@@ -54,23 +71,39 @@ func redactJSON(ctx context.Context, body []byte, cfg privacyShieldConfig, scann
 	if scanner == nil {
 		return nil, nil, errors.New("privacy shield detector is unavailable")
 	}
-	root, err := decodeJSON(body)
+	originalRoot, err := decodeJSON(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("privacy shield requires JSON: %w", err)
 	}
-	redacted, err := redactValue(ctx, root, cfg, scanner, session)
+	redactionRoot, err := decodeJSON(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("privacy shield requires JSON: %w", err)
+	}
+	redacted, err := redactValue(ctx, redactionRoot, cfg, scanner, session)
 	if err != nil {
 		return nil, nil, err
 	}
+	session.finalizeMarkerIndex()
 	if len(session.Mappings) == 0 {
 		return session, body, nil
 	}
-	out, err := marshalJSON(redacted)
-	return session, out, err
+	out, err := rewriteJSONStrings(body, originalRoot, redacted)
+	if err == nil {
+		return session, out, nil
+	}
+	// Duplicate object keys and other unusual-but-valid JSON shapes cannot be
+	// mapped back to unique semantic paths. Preserve the historical safe
+	// fallback instead of rejecting a request that the previous implementation
+	// accepted.
+	out, marshalErr := marshalJSON(redacted)
+	if marshalErr != nil {
+		return nil, nil, fmt.Errorf("privacy JSON rewrite failed: %v; fallback marshal failed: %w", err, marshalErr)
+	}
+	return session, out, nil
 }
 
 func redactValue(ctx context.Context, value any, cfg privacyShieldConfig, scanner detector, session *privacySession) (any, error) {
-	return redactValueForField(ctx, value, "", redactionTraversal{}, cfg, scanner, session)
+	return redactValueForField(ctx, value, "", "$", redactionTraversal{}, cfg, scanner, session)
 }
 
 type payloadMode uint8
@@ -85,20 +118,26 @@ type redactionTraversal struct {
 	payload payloadMode
 }
 
-func redactValueForField(ctx context.Context, value any, field string, traversal redactionTraversal, cfg privacyShieldConfig, scanner detector, session *privacySession) (any, error) {
+func redactValueForField(ctx context.Context, value any, field, path string, traversal redactionTraversal, cfg privacyShieldConfig, scanner detector, session *privacySession) (any, error) {
 	switch node := value.(type) {
 	case map[string]any:
 		protocolNode := traversal.payload == payloadProtocolContent && isProtocolContentBlock(node)
 		if traversal.payload != payloadArbitrary && (traversal.payload == payloadNone || protocolNode) && isOpaqueProtocolBlock(node) {
 			return node, nil
 		}
-		for key, child := range node {
+		keys := make([]string, 0, len(node))
+		for key := range node {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			child := node[key]
 			protocolSemantics := traversal.payload == payloadNone || protocolNode
 			if protocolSemantics && (isOpaqueProtocolValue(node, key) || isProtocolStructuralValue(key, traversal, protocolNode)) {
 				continue
 			}
 			childTraversal := redactionTraversal{payload: nextPayloadMode(node, key, child, traversal.payload, protocolNode)}
-			redacted, err := redactValueForField(ctx, child, key, childTraversal, cfg, scanner, session)
+			redacted, err := redactValueForField(ctx, child, key, appendJSONPath(path, key), childTraversal, cfg, scanner, session)
 			if err != nil {
 				return nil, err
 			}
@@ -107,7 +146,7 @@ func redactValueForField(ctx context.Context, value any, field string, traversal
 		return node, nil
 	case []any:
 		for index, child := range node {
-			redacted, err := redactValueForField(ctx, child, field, traversal, cfg, scanner, session)
+			redacted, err := redactValueForField(ctx, child, field, path+"/"+strconv.Itoa(index), traversal, cfg, scanner, session)
 			if err != nil {
 				return nil, err
 			}
@@ -118,10 +157,16 @@ func redactValueForField(ctx context.Context, value any, field string, traversal
 		if len(node) > cfg.MaxStringBytes {
 			return node, nil
 		}
-		return redactString(ctx, node, cfg.MaxFindings, scanner, session)
+		return redactString(ctx, node, path, cfg.MaxFindings, scanner, session)
 	default:
 		return value, nil
 	}
+}
+
+func appendJSONPath(path, key string) string {
+	key = strings.ReplaceAll(key, "~", "~0")
+	key = strings.ReplaceAll(key, "/", "~1")
+	return path + "/" + key
 }
 
 func isProtocolStructuralValue(field string, traversal redactionTraversal, protocolNode bool) bool {
@@ -337,7 +382,7 @@ func isOpaqueProtocolBlock(node map[string]any) bool {
 	}
 }
 
-func redactString(ctx context.Context, value string, maxFindings int, scanner detector, session *privacySession) (string, error) {
+func redactString(ctx context.Context, value, path string, maxFindings int, scanner detector, session *privacySession) (string, error) {
 	findings, err := scanner.DetectString(ctx, value)
 	if err != nil {
 		return "", err
@@ -348,9 +393,9 @@ func redactString(ctx context.Context, value string, maxFindings int, scanner de
 	}
 	var builder strings.Builder
 	last := 0
-	for _, item := range findings {
+	for findingIndex, item := range findings {
 		original := value[item.Start:item.End]
-		key := item.RuleID + "\x00" + original
+		key := path + "\x00" + item.RuleID + "\x00" + strconv.Itoa(findingIndex)
 		marker, exists := session.byKey[key]
 		if !exists {
 			if maxFindings > 0 && len(session.Mappings) >= maxFindings {
@@ -358,7 +403,7 @@ func redactString(ctx context.Context, value string, maxFindings int, scanner de
 			}
 			marker = session.newMarker(key)
 			session.byKey[key] = marker
-			session.Mappings = append(session.Mappings, mapping{Marker: marker, Original: original, RuleID: item.RuleID, Description: item.Description})
+			session.addMapping(mapping{Marker: marker, Original: original, RuleID: item.RuleID, Description: item.Description})
 		}
 		builder.WriteString(value[last:item.Start])
 		builder.WriteString(marker)
@@ -372,10 +417,93 @@ func redactString(ctx context.Context, value string, maxFindings int, scanner de
 }
 
 func (s *privacySession) newMarker(key string) string {
-	hash := sha256.New()
-	_, _ = hash.Write(s.nonce[:])
-	_, _ = hash.Write([]byte(key))
-	return markerPrefix + hex.EncodeToString(hash.Sum(nil)[:16])
+	if s == nil {
+		return ""
+	}
+	digest := sha256.Sum256([]byte("cpa-sensitive-marker-v1\x00" + key))
+	if s.markerKeys == nil {
+		s.markerKeys = make(map[string]string)
+	}
+	for digestBytes := 8; digestBytes <= len(digest); digestBytes += 4 {
+		marker := markerPrefix + markerEncoding.EncodeToString(digest[:digestBytes]) + "_"
+		if existingKey, exists := s.markerKeys[marker]; !exists || existingKey == key {
+			s.markerKeys[marker] = key
+			return marker
+		}
+	}
+	panic("privacy marker HMAC collision")
+}
+
+func (s *privacySession) addMapping(item mapping) {
+	if s == nil || item.Marker == "" {
+		return
+	}
+	s.Mappings = append(s.Mappings, item)
+	if s.byMarker == nil {
+		s.byMarker = make(map[string]mapping)
+	}
+	s.byMarker[item.Marker] = item
+	if len(item.Marker) > s.maxMarkerLen {
+		s.maxMarkerLen = len(item.Marker)
+	}
+	if item.RuleID != "" {
+		if s.RuleCounts == nil {
+			s.RuleCounts = make(map[string]int)
+		}
+		s.RuleCounts[item.RuleID]++
+	}
+}
+
+func (s *privacySession) finalizeMarkerIndex() {
+	if s == nil {
+		return
+	}
+	s.ensureMarkerIndex()
+}
+
+func (s *privacySession) ensureMarkerIndex() {
+	if s == nil || s.indexReady.Load() {
+		return
+	}
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	if s.indexReady.Load() {
+		return
+	}
+	byMarker := make(map[string]mapping, len(s.Mappings))
+	ruleCounts := make(map[string]int)
+	maxMarkerLen := 0
+	for _, item := range s.Mappings {
+		if item.Marker == "" {
+			continue
+		}
+		byMarker[item.Marker] = item
+		if len(item.Marker) > maxMarkerLen {
+			maxMarkerLen = len(item.Marker)
+		}
+		if item.RuleID != "" {
+			ruleCounts[item.RuleID]++
+		}
+	}
+	s.byMarker = byMarker
+	s.RuleCounts = ruleCounts
+	s.maxMarkerLen = maxMarkerLen
+	s.indexReady.Store(true)
+}
+
+func (s *privacySession) ruleCountsSnapshot() map[string]int {
+	if s == nil {
+		return nil
+	}
+	s.ensureMarkerIndex()
+	if len(s.RuleCounts) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(s.RuleCounts))
+	for ruleID, count := range s.RuleCounts {
+		out[ruleID] = count
+	}
+	return out
 }
 
 func normalizeFindings(value string, findings []finding) []finding {
@@ -481,21 +609,7 @@ func isEmbeddedJSONStringValue(parent map[string]any, containerField, field stri
 }
 
 func restoreRawJSONBytes(body []byte, session *privacySession) ([]byte, int) {
-	restored := append([]byte(nil), body...)
-	count := 0
-	for _, item := range session.Mappings {
-		escaped, _ := json.Marshal(item.Original)
-		if len(escaped) >= 2 {
-			escaped = escaped[1 : len(escaped)-1]
-		}
-		n := strings.Count(string(restored), item.Marker)
-		if n == 0 {
-			continue
-		}
-		restored = []byte(strings.ReplaceAll(string(restored), item.Marker, string(escaped)))
-		count += n
-	}
-	return restored, count
+	return restoreContentBytesWithMode(body, session, true)
 }
 
 type streamRestorer struct {
@@ -533,7 +647,6 @@ func (r *streamRestorer) feed(chunk []byte) ([]byte, bool, int) {
 
 type contentStreamRestorer struct {
 	session        *privacySession
-	maxMarkerLen   int
 	buffers        map[string][]byte
 	claudeThinking map[string]*claudeThinkingState
 }
@@ -545,11 +658,7 @@ func newContentStreamRestorer(session *privacySession) *contentStreamRestorer {
 	if session == nil {
 		return restorer
 	}
-	for _, item := range session.Mappings {
-		if len(item.Marker) > restorer.maxMarkerLen {
-			restorer.maxMarkerLen = len(item.Marker)
-		}
-	}
+	session.ensureMarkerIndex()
 	return restorer
 }
 
@@ -562,26 +671,26 @@ func (r *contentStreamRestorer) feedJSONString(fieldKey, text string) (string, i
 }
 
 func (r *contentStreamRestorer) feedWithMode(fieldKey, text string, jsonString bool) (string, int) {
-	if r == nil || r.session == nil || len(r.session.Mappings) == 0 || r.maxMarkerLen <= 1 || text == "" {
+	if r == nil || r.session == nil || len(r.session.Mappings) == 0 || text == "" {
 		return text, 0
 	}
 	carry := r.buffers[fieldKey]
 	combined := make([]byte, 0, len(carry)+len(text))
 	combined = append(combined, carry...)
 	combined = append(combined, text...)
-	combined, count := restoreContentBytesWithMode(combined, r.session, jsonString)
-	safe := contentTailSafeBoundary(combined, r.maxMarkerLen)
+	safe := partialMarkerStart(combined, r.session)
 	if safe == len(combined) {
 		delete(r.buffers, fieldKey)
-		return string(combined), count
+		out, count := restoreContentBytesWithMode(combined, r.session, jsonString)
+		return string(out), count
 	}
 	if safe <= 0 {
 		r.buffers[fieldKey] = append(carry[:0], combined...)
-		return "", count
+		return "", 0
 	}
-	out, additional := restoreContentBytesWithMode(combined[:safe], r.session, jsonString)
+	out, count := restoreContentBytesWithMode(combined[:safe], r.session, jsonString)
 	r.buffers[fieldKey] = append(carry[:0], combined[safe:]...)
-	return string(out), count + additional
+	return string(out), count
 }
 
 func restoreContentBytes(body []byte, session *privacySession) ([]byte, int) {
@@ -592,48 +701,90 @@ func restoreContentBytesWithMode(body []byte, session *privacySession, jsonStrin
 	if session == nil || len(session.Mappings) == 0 || len(body) == 0 {
 		return body, 0
 	}
-	restored := append([]byte(nil), body...)
+	session.ensureMarkerIndex()
+	if len(session.byMarker) == 0 {
+		return body, 0
+	}
+
+	searchAt := 0
+	lastWrite := 0
 	count := 0
-	for _, item := range session.Mappings {
-		marker := []byte(item.Marker)
-		n := bytes.Count(restored, marker)
-		if n == 0 {
+	var restored []byte
+	lead := []byte(markerLead)
+	for searchAt < len(body) {
+		relative := bytes.Index(body[searchAt:], lead)
+		if relative < 0 {
+			break
+		}
+		start := searchAt + relative
+		item, end, ok := session.matchMarkerAt(body, start)
+		if !ok {
+			searchAt = start + len(lead)
 			continue
 		}
+		if restored == nil {
+			restored = make([]byte, 0, len(body))
+		}
+		restored = append(restored, body[lastWrite:start]...)
 		replacement := []byte(item.Original)
 		if jsonString {
 			encoded, err := json.Marshal(item.Original)
 			if err != nil || len(encoded) < 2 {
+				searchAt = end
 				continue
 			}
 			replacement = encoded[1 : len(encoded)-1]
 		}
-		restored = bytes.ReplaceAll(restored, marker, replacement)
-		count += n
+		restored = append(restored, replacement...)
+		lastWrite = end
+		searchAt = end
+		count++
 	}
+	if count == 0 {
+		return body, 0
+	}
+	restored = append(restored, body[lastWrite:]...)
 	return restored, count
 }
 
-func contentTailSafeBoundary(body []byte, maxMarkerLen int) int {
-	if len(body) == 0 || maxMarkerLen <= 1 {
-		return len(body)
+func (s *privacySession) matchMarkerAt(body []byte, start int) (mapping, int, bool) {
+	if s == nil || start < 0 || start >= len(body) {
+		return mapping{}, start, false
 	}
-	dangerStart := len(body) - (maxMarkerLen - 1)
-	if dangerStart < 0 {
-		dangerStart = 0
-	}
-	prefix := []byte(markerPrefix)
-	for index := dangerStart; index < len(body); index++ {
-		remaining := body[index:]
-		matchLen := len(prefix)
-		if matchLen > len(remaining) {
-			matchLen = len(remaining)
-		}
-		if bytes.Equal(remaining[:matchLen], prefix[:matchLen]) {
-			return index
+	remaining := body[start:]
+	if bytes.HasPrefix(remaining, []byte(legacyMarkerPrefix)) {
+		end := start + len(legacyMarkerPrefix) + 32
+		if end <= len(body) {
+			if item, ok := s.byMarker[string(body[start:end])]; ok {
+				return item, end, true
+			}
 		}
 	}
-	return len(body)
+	if bytes.HasPrefix(remaining, []byte(markerPrefix)) {
+		for end := start + len(markerPrefix); end < len(body) && end-start <= s.maxMarkerLen; end++ {
+			char := body[end]
+			if char == '_' {
+				candidateEnd := end + 1
+				if item, ok := s.byMarker[string(body[start:candidateEnd])]; ok {
+					return item, candidateEnd, true
+				}
+				break
+			}
+			if !isMarkerBase32Char(char) {
+				break
+			}
+		}
+	}
+	limit := start + s.maxMarkerLen
+	if limit > len(body) {
+		limit = len(body)
+	}
+	for end := start + len(markerLead); end <= limit; end++ {
+		if item, ok := s.byMarker[string(body[start:end])]; ok {
+			return item, end, true
+		}
+	}
+	return mapping{}, start, false
 }
 
 func (r *streamRestorer) streamTerminal(body []byte) bool {
@@ -653,20 +804,71 @@ func (r *streamRestorer) flush() ([]byte, int) {
 }
 
 func partialMarkerStart(body []byte, session *privacySession) int {
-	start := len(body)
-	for _, item := range session.Mappings {
-		marker := []byte(item.Marker)
-		max := len(marker) - 1
-		if max > len(body) {
-			max = len(body)
+	if session == nil || len(body) == 0 {
+		return len(body)
+	}
+	session.ensureMarkerIndex()
+	if session.maxMarkerLen <= 1 {
+		return len(body)
+	}
+	dangerStart := len(body) - (session.maxMarkerLen - 1)
+	if dangerStart < 0 {
+		dangerStart = 0
+	}
+	for start := dangerStart; start < len(body); start++ {
+		remaining := body[start:]
+		if _, end, ok := session.matchMarkerAt(body, start); ok && end <= len(body) {
+			continue
 		}
-		for size := max; size > 0; size-- {
-			if string(body[len(body)-size:]) == string(marker[:size]) && len(body)-size < start {
-				start = len(body) - size
-			}
+		if session.possibleMarkerPrefix(remaining) {
+			return start
 		}
 	}
-	return start
+	return len(body)
+}
+
+func (s *privacySession) possibleMarkerPrefix(remaining []byte) bool {
+	if s == nil || len(remaining) == 0 || len(remaining) >= s.maxMarkerLen {
+		return false
+	}
+	compactPrefix := []byte(markerPrefix)
+	if bytes.HasPrefix(compactPrefix, remaining) {
+		return true
+	}
+	if bytes.HasPrefix(remaining, compactPrefix) {
+		suffix := remaining[len(compactPrefix):]
+		if len(suffix) == 0 {
+			return true
+		}
+		for _, char := range suffix {
+			if !isMarkerBase32Char(byte(char)) {
+				return false
+			}
+		}
+		return true
+	}
+	legacyPrefix := []byte(legacyMarkerPrefix)
+	if bytes.HasPrefix(legacyPrefix, remaining) {
+		return true
+	}
+	if !bytes.HasPrefix(remaining, legacyPrefix) {
+		return false
+	}
+	hexSuffix := remaining[len(legacyPrefix):]
+	if len(hexSuffix) >= 32 {
+		return false
+	}
+	for _, char := range hexSuffix {
+		if (char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isMarkerBase32Char(char byte) bool {
+	return (char >= 'A' && char <= 'Z') || (char >= '2' && char <= '7')
 }
 
 func streamTerminalChunk(body []byte) bool {

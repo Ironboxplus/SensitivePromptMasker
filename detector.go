@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	gitleaksdetect "github.com/zricethezav/gitleaks/v8/detect"
 )
@@ -95,13 +96,51 @@ func builtinPatterns(privacy privacyShieldConfig) []regexRule {
 	add(cfg.MACAddress, "pii-mac-address", "MAC address", `(?:^|[^0-9A-Fa-f])([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})(?:$|[^0-9A-Fa-f])`, 1, nil)
 	add(cfg.IPv6, "pii-ipv6", "IPv6 address", `[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:.]{2,}`, 0, validIPv6)
 	add(cfg.Path, "pii-path", "local filesystem path", `(?i)(?:[A-Z]:[\\/](?:[^\\/\s\"'<>|?*]+[\\/])*[^\\/\s\"'<>|?*]+|/(?:home|Users|root|var|etc|opt|usr|srv|tmp|mnt|workspace|data)(?:/[A-Za-z0-9._@+:-]+)+)`, 0, nil)
-	add(cfg.GenericToken, "pii-generic-token", "generic high-entropy token", `\b[A-Za-z0-9_\-]{32,}\b`, 0, nil)
+	add(cfg.GenericToken, "pii-generic-token", "generic high-entropy token", `\b[A-Za-z0-9_\-]{32,}\b`, 0, validGenericToken)
 	aggressive := privacy.PIIAggressive
 	add(boolPointer(aggressive || boolValue(privacy.PIIAggressiveTypes.RelativePath)), "pii-relative-path", "relative filesystem path", `(?:^|[\s\"'`+"`"+`({\[])((?:\.{1,2}[\\/])(?:[A-Za-z0-9._@+:-]+[\\/])*[A-Za-z0-9._@+:-]+)`, 1, nil)
 	add(boolPointer(aggressive || boolValue(privacy.PIIAggressiveTypes.UsernameHostname)), "pii-username-hostname", "username and hostname", `\b([A-Za-z_][A-Za-z0-9._-]{1,31}@[A-Za-z0-9][A-Za-z0-9.-]{1,253})\b`, 1, nil)
-	add(boolPointer(aggressive || boolValue(privacy.PIIAggressiveTypes.GenericToken)), "pii-generic-token-aggressive", "generic high-entropy token", `\b[A-Za-z0-9_\-]{24,}\b`, 0, nil)
+	add(boolPointer(aggressive || boolValue(privacy.PIIAggressiveTypes.GenericToken)), "pii-generic-token-aggressive", "generic high-entropy token", `\b[A-Za-z0-9_\-]{24,}\b`, 0, validGenericToken)
 	add(boolPointer(aggressive || boolValue(privacy.PIIAggressiveTypes.LooseSecret)), "pii-loose-secret", "loosely labeled secret", `(?i)(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*[\"']?([^\s\"']{8,})`, 1, nil)
 	return rules
+}
+
+func validGenericToken(value string) bool {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "mcp__") {
+		return false
+	}
+	return value != lower || !isWordLikeIdentifier(lower)
+}
+
+func isWordLikeIdentifier(value string) bool {
+	if !strings.ContainsAny(value, "_-") {
+		return false
+	}
+	parts := strings.FieldsFunc(value, func(char rune) bool {
+		return char == '_' || char == '-'
+	})
+	if len(parts) < 2 {
+		return false
+	}
+	alphabeticParts := 0
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		lettersOnly := true
+		for _, char := range part {
+			if char < 'a' || char > 'z' {
+				lettersOnly = false
+				break
+			}
+		}
+		if lettersOnly && len(part) >= 2 {
+			alphabeticParts++
+		}
+	}
+	return alphabeticParts >= 2
 }
 
 type gitleaksDetector struct{ detector *gitleaksdetect.Detector }
@@ -183,6 +222,11 @@ func validPhone(value string) bool {
 		}
 		return -1
 	}, value)
+	if len(digits) == 8 {
+		if _, err := time.Parse("20060102", digits); err == nil {
+			return false
+		}
+	}
 	return len(digits) >= 7 && len(digits) <= 15
 }
 

@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -162,6 +165,162 @@ func TestPrivacyShieldRestoresJSONEscaping(t *testing.T) {
 	}
 }
 
+func TestPrivacyShieldProducesStablePromptBytesAcrossRetries(t *testing.T) {
+	cfg := testConfig()
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"system":[{"type":"text","text":"person@example.com"}],"messages":[{"role":"user","content":"C:\\Users\\alice\\secret"}]}`)
+
+	_, first, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("identical retries produced different prompt bytes:\nfirst=%s\nsecond=%s", first, second)
+	}
+}
+
+func TestPrivacyMarkerIsStableAcrossProcesses(t *testing.T) {
+	run := func() string {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestPrivacyMarkerSubprocessHelper$")
+		cmd.Env = append(os.Environ(), "CPA_MARKER_SUBPROCESS=1")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("marker subprocess failed: %v\n%s", err, output)
+		}
+		start := strings.Index(string(output), markerPrefix)
+		if start < 0 {
+			t.Fatalf("marker missing from subprocess output: %q", output)
+		}
+		end := strings.Index(string(output[start+len(markerPrefix):]), "_")
+		if end < 0 {
+			t.Fatalf("marker terminator missing from subprocess output: %q", output)
+		}
+		return string(output[start : start+len(markerPrefix)+end+1])
+	}
+	first := run()
+	second := run()
+	if first != second {
+		t.Fatalf("same JSON location changed marker across processes: first=%q second=%q", first, second)
+	}
+}
+
+func TestPrivacyMarkerSubprocessHelper(t *testing.T) {
+	if os.Getenv("CPA_MARKER_SUBPROCESS") != "1" {
+		t.Skip("subprocess helper")
+	}
+	fmt.Print(newPrivacySession().newMarker("/system/0/text\x00pii-email\x000"))
+}
+
+func TestPrivacyMarkerUsesLocationInsteadOfSecretValue(t *testing.T) {
+	cfg := testConfig()
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, first, err := redactJSON(context.Background(), []byte(`{"system":[{"type":"text","text":"first@example.com"}]}`), cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := redactJSON(context.Background(), []byte(`{"system":[{"type":"text","text":"second@example.com"}]}`), cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markerFromBody(t, first) != markerFromBody(t, second) {
+		t.Fatalf("same JSON location produced a value-dependent marker: first=%s second=%s", first, second)
+	}
+}
+
+func TestPrivacyShieldPreservesUntouchedJSONBytes(t *testing.T) {
+	cfg := testConfig()
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("{\n  \"z\": 1, \"messages\": [ { \"content\": \"person@example.com\", \"role\": \"user\" } ],\n  \"a\": {\"escaped\":\"keep\\\\path\"}\n}")
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted)
+	roundTrip := bytes.ReplaceAll(redacted, []byte(marker), []byte("person@example.com"))
+	if !bytes.Equal(roundTrip, body) {
+		t.Fatalf("redaction rewrote untouched JSON bytes:\noriginal=%s\nredacted=%s", body, redacted)
+	}
+}
+
+func TestPrivacyShieldFallsBackForDuplicateJSONKeys(t *testing.T) {
+	cfg := testConfig()
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"metadata":{"label":"first","label":"second"},"messages":[{"role":"user","content":"person@example.com"}]}`)
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatalf("valid JSON with duplicate keys should retain the previous fallback behavior: %v", err)
+	}
+	if bytes.Contains(redacted, []byte("person@example.com")) || !bytes.Contains(redacted, []byte(markerPrefix)) {
+		t.Fatalf("fallback redaction failed: %s", redacted)
+	}
+}
+
+func TestGenericTokenDetectorIgnoresMCPToolIdentifiers(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.GenericToken = boolPointer(true)
+	cfg.Privacy.PIIAggressiveTypes.GenericToken = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"messages":[{"role":"user","content":"mcp__plugin_oh-my-claudecode_t__project_memory_write oh-my-claudecode-project-session-manager AbCDef0123456789_zyXWVUTsrqponmlk"}]}`)
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(redacted, []byte("mcp__plugin_oh-my-claudecode_t__project_memory_write")) {
+		t.Fatalf("public MCP tool identifier was redacted: %s", redacted)
+	}
+	if !bytes.Contains(redacted, []byte("oh-my-claudecode-project-session-manager")) {
+		t.Fatalf("word-like public identifier was redacted: %s", redacted)
+	}
+	if bytes.Contains(redacted, []byte("AbCDef0123456789_zyXWVUTsrqponmlk")) || !bytes.Contains(redacted, []byte(markerPrefix)) {
+		t.Fatalf("real high-entropy token was not redacted: %s", redacted)
+	}
+}
+
+func TestPhoneDetectorIgnoresCalendarDates(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Phone = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"messages":[{"role":"user","content":"dates 2026-07-16 and 20260716; phone +1 415 555 2671"}]}`)
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(redacted, []byte("2026-07-16")) || !bytes.Contains(redacted, []byte("20260716")) {
+		t.Fatalf("calendar date was redacted as a phone number: %s", redacted)
+	}
+	if bytes.Contains(redacted, []byte("+1 415 555 2671")) || !bytes.Contains(redacted, []byte(markerPrefix)) {
+		t.Fatalf("real phone number was not redacted: %s", redacted)
+	}
+}
+
 func TestStreamRestorerCarriesSplitMarker(t *testing.T) {
 	session := newPrivacySession()
 	marker := session.newMarker("test")
@@ -189,6 +348,18 @@ func TestStreamRestorerDoesNotTreatNullFinishReasonAsTerminal(t *testing.T) {
 	second, _, count := restorer.feed([]byte(marker[15:] + `"}\n\n`))
 	if count != 1 || !strings.Contains(string(second), "secret") {
 		t.Fatalf("marker was not restored after null finish_reason: %q", second)
+	}
+}
+
+func TestContentStreamRestorerDoesNotBufferNonMarkerCPAText(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("test")
+	session.Mappings = []mapping{{Marker: marker, Original: "secret"}}
+	restorer := newContentStreamRestorer(session)
+
+	out, count := restorer.feed("text", "ordinary CPA_X")
+	if count != 0 || out != "ordinary CPA_X" {
+		t.Fatalf("ordinary CPA text was buffered as a marker prefix: count=%d body=%q", count, out)
 	}
 }
 
@@ -378,7 +549,7 @@ func TestStreamRestorerEscapesWindowsPathInsideToolArgumentJSON(t *testing.T) {
 
 	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
 	for _, protocol := range protocols {
-		for split := 1; split < len(markerPrefix)+8; split++ {
+		for split := 1; split < len(newPrivacySession().newMarker("windows-path")); split++ {
 			t.Run(fmt.Sprintf("%s/split-%d", protocol.name, split), func(t *testing.T) {
 				session := newPrivacySession()
 				marker := session.newMarker("windows-path")
@@ -607,6 +778,39 @@ func TestEngineUsesCPARequestIDForIsolation(t *testing.T) {
 	}
 }
 
+func TestRequestInterceptorsMaskForwardedHost(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := requestInterceptRequest{
+		Model:   "claude-fable-5",
+		Headers: http.Header{"X-Forwarded-Host": []string{"private.gateway.example"}},
+		Body:    []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+	}
+
+	before, err := instance.interceptBefore(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := before.Headers.Get("X-Forwarded-Host"); got != "api.anthropic.com" {
+		t.Fatalf("before-auth X-Forwarded-Host = %q, want api.anthropic.com", got)
+	}
+	if got := request.Headers.Get("X-Forwarded-Host"); got != "private.gateway.example" {
+		t.Fatalf("input headers were mutated: %q", got)
+	}
+
+	request.Headers = before.Headers
+	after, err := instance.interceptAfter(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.Headers.Get("X-Forwarded-Host"); got != "api.anthropic.com" {
+		t.Fatalf("after-auth X-Forwarded-Host = %q, want api.anthropic.com", got)
+	}
+}
+
 func TestBuildPluginExposesOfficialSDKCapabilities(t *testing.T) {
 	plugin, err := buildPlugin([]byte("enabled: true\n"))
 	if err != nil {
@@ -692,15 +896,65 @@ privacy_shield:
 		t.Fatal(err)
 	}
 
-	if captured.HostCallbackID != "callback-safe-log" || captured.Message != "SensitivePromptMasker request.redacted count=1 source=codex target=claude stream=false" {
+	if captured.HostCallbackID != "callback-safe-log" || !strings.HasPrefix(captured.Message, "SensitivePromptMasker request.redacted count=1 source=codex target=claude stream=false") {
 		t.Fatalf("captured host log = %#v", captured)
 	}
 	if captured.Fields["count"] != float64(1) || captured.Fields["request_id"] != "request-host-log" {
 		t.Fatalf("captured host log fields = %#v", captured.Fields)
 	}
+	ruleCounts, ok := captured.Fields["rule_counts"].(map[string]any)
+	if !ok || ruleCounts["pii-email"] != float64(1) {
+		t.Fatalf("captured rule counts = %#v, want pii-email=1", captured.Fields["rule_counts"])
+	}
+	if !strings.Contains(captured.Message, "rules=pii-email:1") {
+		t.Fatalf("captured host log message lacks safe rule histogram: %q", captured.Message)
+	}
 	raw, _ := json.Marshal(captured)
-	if strings.Contains(string(raw), "person@example.com") || strings.Contains(string(raw), "CPA_RESTORE_SECRET_") {
+	if strings.Contains(string(raw), "person@example.com") || strings.Contains(string(raw), legacyMarkerPrefix) || strings.Contains(string(raw), markerPrefix) {
 		t.Fatalf("host activity log leaked sensitive content: %s", raw)
+	}
+}
+
+func TestPrivacyMarkersAreCompactUniqueAndStableAcrossRetries(t *testing.T) {
+	first := newPrivacySession()
+	markerA := first.newMarker("rule-a\x00secret-a")
+	first.Mappings = append(first.Mappings, mapping{Marker: markerA, Original: "secret-a", RuleID: "rule-a"})
+	markerB := first.newMarker("rule-b\x00secret-b")
+	first.Mappings = append(first.Mappings, mapping{Marker: markerB, Original: "secret-b", RuleID: "rule-b"})
+
+	if len(markerA) > 32 || len(markerB) > 32 {
+		t.Fatalf("markers are not compact: len(a)=%d len(b)=%d", len(markerA), len(markerB))
+	}
+	if markerA == markerB {
+		t.Fatalf("different mappings share marker %q", markerA)
+	}
+	if !strings.HasPrefix(markerA, "CPA_S_") || !strings.HasPrefix(markerB, "CPA_S_") {
+		t.Fatalf("compact marker prefix missing: %q %q", markerA, markerB)
+	}
+
+	second := newPrivacySession()
+	markerOtherSession := second.newMarker("rule-a\x00secret-a")
+	if markerOtherSession != markerA {
+		t.Fatalf("same sensitive value changed marker across retries: first=%q second=%q", markerA, markerOtherSession)
+	}
+}
+
+func BenchmarkRestoreContentManyMappings(b *testing.B) {
+	session := newPrivacySession()
+	for index := 0; index < 560; index++ {
+		original := fmt.Sprintf("secret-%06d", index)
+		marker := session.newMarker(fmt.Sprintf("rule-%d\x00%s", index, original))
+		session.Mappings = append(session.Mappings, mapping{Marker: marker, Original: original, RuleID: fmt.Sprintf("rule-%d", index)})
+	}
+	body := []byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"prefix ` + session.Mappings[559].Marker + ` suffix"}}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out, count := restoreContentBytes(body, session)
+		if count != 1 || !bytes.Contains(out, []byte("secret-000559")) {
+			b.Fatalf("restore failed: count=%d body=%s", count, out)
+		}
 	}
 }
 
@@ -1016,7 +1270,15 @@ func markerFromBody(t *testing.T, body []byte) string {
 	if start < 0 {
 		t.Fatalf("marker missing: %s", body)
 	}
-	end := start + len(markerPrefix) + 32
+	markerBodyStart := start + len(markerPrefix)
+	if markerBodyStart >= len(body) {
+		t.Fatalf("compact marker is truncated: %s", body)
+	}
+	end := strings.Index(string(body[markerBodyStart:]), "_")
+	if end < 0 {
+		t.Fatalf("marker terminator missing: %s", body)
+	}
+	end += markerBodyStart + 1
 	return string(body[start:end])
 }
 

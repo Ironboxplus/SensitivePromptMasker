@@ -1,6 +1,9 @@
 package main
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type activityEvent struct {
 	Stage        string
@@ -10,6 +13,8 @@ type activityEvent struct {
 	RequestID    string
 	Count        int
 	Stream       bool
+	RuleCounts   map[string]int
+	Elapsed      time.Duration
 }
 
 type activityLogger func(activityEvent)
