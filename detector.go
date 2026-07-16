@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"net/netip"
 	"regexp"
 	"strconv"
@@ -86,7 +87,8 @@ func builtinPatterns(privacy privacyShieldConfig) []regexRule {
 		}
 	}
 	add(cfg.Email, "pii-email", "email address", `[A-Za-z0-9.!#$%&'*+/=?^_`+"`"+`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+`, 0, nil)
-	add(cfg.Phone, "pii-phone", "phone number", `(?:^|[^0-9A-Za-z])((?:\+?[0-9]{1,3}[- .]?)?(?:\(?[0-9]{2,4}\)?[- .]?){2,5}[0-9]{2,4})(?:$|[^0-9A-Za-z])`, 1, validPhone)
+	add(cfg.Phone, "pii-phone", "phone number", `(?i)(?:phone|telephone|tel|mobile|cell|contact(?:\s+number)?|电话|手机|联系电话)\s*(?:number)?\s*[:=：]?\s*([+]?[0-9][0-9() .-]{5,}[0-9])`, 1, validPhone)
+	add(cfg.Phone, "pii-phone", "phone number", `(?:^|[^0-9A-Za-z])((?:\+?[0-9]{1,3}[- .]?)?(?:\(?[0-9]{2,4}\)?[- .]?){2,5}[0-9]{2,4})(?:$|[^0-9A-Za-z])`, 1, validStandalonePhone)
 	add(cfg.NationalID, "pii-national-id-cn", "Chinese national ID", `(?:^|[^0-9A-Za-z])([1-9][0-9]{16}[0-9Xx])(?:$|[^0-9A-Za-z])`, 1, validCNID)
 	add(cfg.BankCard, "pii-bank-card", "bank card number", `(?:^|[^0-9])([0-9][0-9 -]{11,28}[0-9])(?:$|[^0-9])`, 1, validLuhn)
 	add(cfg.IP, "pii-ipv4", "IPv4 address", `(?:^|[^0-9A-Za-z])((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?:$|[^0-9A-Za-z])`, 1, validIP)
@@ -111,7 +113,45 @@ func validGenericToken(value string) bool {
 	if strings.HasPrefix(lower, "mcp__") {
 		return false
 	}
-	return value != lower || !isWordLikeIdentifier(lower)
+	if isWordLikeIdentifier(lower) {
+		return false
+	}
+	if isASCIILetters(value) {
+		return len(value) >= 32 && shannonEntropy(value) >= 4.2
+	}
+	return shannonEntropy(value) >= 3.5
+}
+
+func isASCIILetters(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+func shannonEntropy(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	var counts [256]int
+	for index := 0; index < len(value); index++ {
+		counts[value[index]]++
+	}
+	total := float64(len(value))
+	entropy := 0.0
+	for _, count := range counts {
+		if count == 0 {
+			continue
+		}
+		probability := float64(count) / total
+		entropy -= probability * math.Log2(probability)
+	}
+	return entropy
 }
 
 func isWordLikeIdentifier(value string) bool {
@@ -228,6 +268,46 @@ func validPhone(value string) bool {
 		}
 	}
 	return len(digits) >= 7 && len(digits) <= 15
+}
+
+func validStandalonePhone(value string) bool {
+	if !validPhone(value) {
+		return false
+	}
+	trimmed := strings.TrimSpace(value)
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, trimmed)
+	if strings.Count(trimmed, "(") != strings.Count(trimmed, ")") {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "+") {
+		return true
+	}
+	groups := strings.FieldsFunc(trimmed, func(r rune) bool { return r < '0' || r > '9' })
+	switch len(groups) {
+	case 2:
+		return len(groups[0]) >= 2 && len(groups[0]) <= 4 && len(groups[1]) >= 7 && len(groups[1]) <= 8
+	case 3:
+		return len(groups[0]) >= 2 && len(groups[0]) <= 4 && len(groups[1]) >= 2 && len(groups[1]) <= 4 && len(groups[2]) == 4
+	case 4:
+		return len(groups[0]) >= 1 && len(groups[0]) <= 3 && len(groups[1]) >= 2 && len(groups[1]) <= 4 && len(groups[2]) >= 2 && len(groups[2]) <= 4 && len(groups[3]) == 4
+	case 1:
+		// Continue with well-known unformatted national-number shapes below.
+	default:
+		return false
+	}
+	switch len(digits) {
+	case 10:
+		return (digits[0] >= '2' && digits[0] <= '9' && digits[3] >= '2' && digits[3] <= '9') || digits[0] >= '6'
+	case 11:
+		return digits[0] == '1' && digits[1] >= '3' && digits[1] <= '9'
+	default:
+		return false
+	}
 }
 
 func validIP(value string) bool {

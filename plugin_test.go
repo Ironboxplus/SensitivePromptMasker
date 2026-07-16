@@ -290,6 +290,76 @@ func TestGenericTokenDetectorIgnoresMCPToolIdentifiers(t *testing.T) {
 	}
 }
 
+func TestGenericTokenDetectorIgnoresPublicMixedCaseIdentifiers(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.GenericToken = boolPointer(true)
+	cfg.Privacy.PIIAggressiveTypes.GenericToken = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		publicIdentifier = "SensitivePromptMaskerRequestInterceptor"
+		realToken        = "AbCDef0123456789_zyXWVUTsrqponmlk"
+	)
+	body := []byte(`{"tools":[{"description":"` + publicIdentifier + `"}],"messages":[{"role":"user","content":"` + realToken + `"}]}`)
+	session, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(redacted, []byte(publicIdentifier)) {
+		t.Fatalf("public mixed-case identifier was redacted: %s", redacted)
+	}
+	if bytes.Contains(redacted, []byte(realToken)) || !bytes.Contains(redacted, []byte(markerPrefix)) {
+		t.Fatalf("real high-entropy token was not redacted: %s", redacted)
+	}
+	if len(session.Mappings) != 1 {
+		t.Fatalf("mapping count = %d, want only the real token; mappings=%#v", len(session.Mappings), session.Mappings)
+	}
+}
+
+func TestPhoneDetectorIgnoresTechnicalNumbersButKeepsPhones(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Phone = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		decimalMetric = "1234.56789"
+		versionNumber = "2026-12345"
+		localBuildID  = "1234567"
+		dottedCounter = "123.456.789.01"
+		openTuple     = "(1234.56789"
+		usPhone       = "+1 (415) 555-2671"
+		cnPhone       = "13812345678"
+	)
+	body := []byte(`{"messages":[{"role":"user","content":"metric ` + decimalMetric + ` version ` + versionNumber + ` build ` + localBuildID + ` counter ` + dottedCounter + ` tuple ` + openTuple + ` phones ` + usPhone + ` and ` + cnPhone + `"}]}`)
+	session, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, technical := range []string{decimalMetric, versionNumber, localBuildID, dottedCounter, openTuple} {
+		if !bytes.Contains(redacted, []byte(technical)) {
+			t.Fatalf("technical number %q was redacted: %s", technical, redacted)
+		}
+	}
+	for _, phone := range []string{usPhone, cnPhone} {
+		if bytes.Contains(redacted, []byte(phone)) {
+			t.Fatalf("phone %q was not redacted: %s", phone, redacted)
+		}
+	}
+	if len(session.Mappings) != 2 {
+		t.Fatalf("mapping count = %d, want two real phones; mappings=%#v", len(session.Mappings), session.Mappings)
+	}
+}
+
 func TestPhoneDetectorIgnoresCalendarDates(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Privacy.Enabled = true
