@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://github.com/Ironboxplus/SensitivePromptMasker/releases/latest"><img src="https://img.shields.io/github/v/release/Ironboxplus/SensitivePromptMasker?style=flat-square&label=release" alt="最新版本"></a>
   <a href="https://github.com/Ironboxplus/SensitivePromptMasker/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/Ironboxplus/SensitivePromptMasker/build.yml?style=flat-square&label=build" alt="构建状态"></a>
+  <a href="https://linux.do/"><img src="https://img.shields.io/badge/community-Linux.do-1f8b4c?style=flat-square" alt="Linux.do 社区"></a>
   <img src="https://img.shields.io/badge/CPA-official%20plugin-55d6be?style=flat-square" alt="CPA 官方插件接口">
   <img src="https://img.shields.io/badge/Go-C--ABI-58c7e8?style=flat-square" alt="Go C ABI">
 </p>

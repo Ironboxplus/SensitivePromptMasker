@@ -4,6 +4,8 @@
 
 Repository: https://github.com/Ironboxplus/SensitivePromptMasker
 
+Community: [Linux.do](https://linux.do/)
+
 `cpa-sensitive` is a standalone CLIProxyAPI C-ABI plugin extracted from the
 Octopus prompt sanitization and Privacy Shield work. CPA itself only supplies
 the public interceptor lifecycle and a stable `cpa_request_id` metadata value.
