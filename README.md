@@ -1,5 +1,7 @@
 # SensitivePromptMasker
 
+[简体中文](README_CN.md) | English
+
 Repository: https://github.com/Ironboxplus/SensitivePromptMasker
 
 `cpa-sensitive` is a standalone CLIProxyAPI C-ABI plugin extracted from the
