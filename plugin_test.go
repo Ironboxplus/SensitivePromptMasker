@@ -1,0 +1,1023 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+func testConfig() config {
+	cfg := defaultConfig()
+	cfg.Enabled = true
+	cfg.Sanitization.Enabled = true
+	cfg.Sanitization.ReplacementGroups = []replacementGroup{{
+		Models: []string{"gpt-*"}, SourceFormats: []string{"openai"},
+		Replacements: []replacement{{Src: "Claude Code", Dst: "CLI", Order: intPointer(1)}, {Src: "CLI", Dst: "client", Order: intPointer(2)}},
+	}}
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	return cfg
+}
+
+func TestSanitizationMatchesOctopusRoleAndOrderSemantics(t *testing.T) {
+	cfg := testConfig()
+	body := []byte(`{"messages":[{"role":"system","content":"Claude Code"},{"role":"user","content":"Claude Code"},{"role":"assistant","content":[{"type":"text","text":"Claude Code"}]}]}`)
+	out, count, err := sanitizeRequest(body, cfg.Sanitization, "gpt-5", "openai", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("replacement count = %d, want 4 sequential replacements", count)
+	}
+	var decoded struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Messages[0].Content != "client" || decoded.Messages[1].Content != "Claude Code" {
+		t.Fatalf("unexpected sanitized body: %s", out)
+	}
+}
+
+func TestClaudeAdapterSanitizesSystemAndAssistantOnly(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sanitization.ReplacementGroups[0].SourceFormats = []string{"claude"}
+	body := []byte(`{"system":[{"type":"text","text":"Claude Code"}],"messages":[{"role":"user","content":"Claude Code"},{"role":"assistant","content":[{"type":"text","text":"Claude Code"}]}]}`)
+	out, count, err := sanitizeRequest(body, cfg.Sanitization, "gpt-5", "claude", "")
+	if err != nil || count != 4 {
+		t.Fatalf("Claude adapter count=%d err=%v body=%s", count, err, out)
+	}
+	if strings.Count(string(out), "client") != 2 || strings.Count(string(out), "Claude Code") != 1 {
+		t.Fatalf("Claude adapter rewrote wrong fields: %s", out)
+	}
+}
+
+func TestCodexAdapterSanitizesInstructionsAndDeveloperInput(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sanitization.ReplacementGroups[0].SourceFormats = []string{"codex"}
+	body := []byte(`{"instructions":"Claude Code","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Claude Code"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Claude Code"}]}]}`)
+	out, count, err := sanitizeRequest(body, cfg.Sanitization, "gpt-5", "codex", "")
+	if err != nil || count != 4 {
+		t.Fatalf("Codex adapter count=%d err=%v body=%s", count, err, out)
+	}
+	if strings.Count(string(out), "client") != 2 || strings.Count(string(out), "Claude Code") != 1 {
+		t.Fatalf("Codex adapter rewrote wrong fields: %s", out)
+	}
+}
+
+func TestSanitizationToFormatRunsAfterAuthOnly(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sanitization.ReplacementGroups[0].SourceFormats = nil
+	cfg.Sanitization.ReplacementGroups[0].ToFormats = []string{"codex"}
+	body := []byte(`{"instructions":"Claude Code"}`)
+	before, count, err := sanitizeRequest(body, cfg.Sanitization, "gpt-5", "openai", "")
+	if err != nil || count != 0 || string(before) != string(body) {
+		t.Fatalf("before-auth to_formats rule unexpectedly ran: count=%d body=%s err=%v", count, before, err)
+	}
+	after, count, err := sanitizeRequestAfterAuth(body, cfg.Sanitization, "gpt-5", "openai", "codex")
+	if err != nil || count != 2 || !strings.Contains(string(after), "client") {
+		t.Fatalf("after-auth to_formats rule did not run: count=%d body=%s err=%v", count, after, err)
+	}
+}
+
+func TestSanitizationToFormatUsesSourceBodyShapeAfterAuth(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sanitization.ReplacementGroups[0].SourceFormats = []string{"codex"}
+	cfg.Sanitization.ReplacementGroups[0].ToFormats = []string{"claude"}
+	body := []byte(`{"instructions":"Claude Code","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Claude Code"}]}]}`)
+
+	after, count, err := sanitizeRequestAfterAuth(body, cfg.Sanitization, "gpt-5", "codex", "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 || strings.Count(string(after), "client") != 2 {
+		t.Fatalf("after-auth request was not sanitized using the source body shape: count=%d body=%s", count, after)
+	}
+}
+
+func TestConfigNormalizesLegacyFlatReplacementAndPIITypes(t *testing.T) {
+	raw := []byte(`enabled: true
+sanitization:
+  enabled: true
+  system_prompt_replacements:
+    - models: ["gpt-*"]
+      src: old
+      dst: new
+privacy_shield:
+  enabled: true
+  debug_cache_ttl_seconds: 123
+  pii_types:
+    gitleaks: false
+    email: false
+  pii_aggressive_types:
+    loose_secret: true
+`)
+	cfg, err := parseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Sanitization.ReplacementGroups) != 1 || cfg.Sanitization.ReplacementGroups[0].Replacements[0].Src != "old" {
+		t.Fatalf("legacy replacement was not normalized: %#v", cfg.Sanitization)
+	}
+	if boolValue(cfg.Privacy.Gitleaks) || boolValue(cfg.Privacy.PII.Email) {
+		t.Fatalf("legacy pii_types was not honored: %#v", cfg.Privacy)
+	}
+	if cfg.Session.TTLSeconds != 123 || !boolValue(cfg.Privacy.PIIAggressiveTypes.LooseSecret) {
+		t.Fatalf("legacy privacy TTL/aggressive types were not honored: %#v", cfg)
+	}
+}
+
+func TestPrivacyShieldRestoresJSONEscaping(t *testing.T) {
+	cfg := testConfig()
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := `person@example.com and C:\Users\alice\secret`
+	body, _ := json.Marshal(map[string]string{"prompt": original})
+	session, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(session.Mappings) < 2 || !strings.Contains(string(redacted), markerPrefix) {
+		t.Fatalf("redaction failed: %s", redacted)
+	}
+	response, _ := json.Marshal(map[string]string{"answer": string(redacted)})
+	restored, count := restoreJSONBytes(response, session)
+	if count == 0 {
+		t.Fatal("no marker restored")
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal(restored, &decoded); err != nil {
+		t.Fatalf("invalid restored JSON: %v\n%s", err, restored)
+	}
+}
+
+func TestStreamRestorerCarriesSplitMarker(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("test")
+	session.Mappings = []mapping{{Marker: marker, Original: `secret\"value`}}
+	restorer := &streamRestorer{session: session}
+	first, drop, _ := restorer.feed([]byte(`data: {"delta":"` + marker[:12]))
+	if drop || len(first) == 0 {
+		t.Fatalf("first chunk should emit safe prefix: drop=%v body=%q", drop, first)
+	}
+	second, _, count := restorer.feed([]byte(marker[12:] + `"}\n\n`))
+	if count != 1 || !strings.Contains(string(second), `secret\\\"value`) {
+		t.Fatalf("split restore failed: %q", second)
+	}
+}
+
+func TestStreamRestorerDoesNotTreatNullFinishReasonAsTerminal(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("test")
+	session.Mappings = []mapping{{Marker: marker, Original: "secret"}}
+	restorer := &streamRestorer{session: session}
+	first, _, _ := restorer.feed([]byte(`data: {"finish_reason":null,"delta":"` + marker[:15]))
+	if strings.Contains(string(first), marker[:15]) {
+		t.Fatalf("partial marker leaked from non-terminal chunk: %q", first)
+	}
+	second, _, count := restorer.feed([]byte(marker[15:] + `"}\n\n`))
+	if count != 1 || !strings.Contains(string(second), "secret") {
+		t.Fatalf("marker was not restored after null finish_reason: %q", second)
+	}
+}
+
+func TestStreamRestorerRestoresMarkerSplitAcrossProtocolContentDeltas(t *testing.T) {
+	tests := []struct {
+		name        string
+		format      string
+		firstChunk  func(string) []byte
+		secondChunk func(string) []byte
+	}{
+		{
+			name:   "OpenAI chat content",
+			format: "openai",
+			firstChunk: func(text string) []byte {
+				return []byte(`data: {"choices":[{"index":0,"delta":{"content":"` + text + `"},"finish_reason":null}]}` + "\n\n")
+			},
+			secondChunk: func(text string) []byte {
+				return []byte(`data: {"choices":[{"index":0,"delta":{"content":"` + text + `"},"finish_reason":null}]}` + "\n\n")
+			},
+		},
+		{
+			name:   "Claude text delta",
+			format: "claude",
+			firstChunk: func(text string) []byte {
+				return []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + text + `"}}` + "\n\n")
+			},
+			secondChunk: func(text string) []byte {
+				return []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + text + `"}}` + "\n\n")
+			},
+		},
+		{
+			name:   "Codex Responses delta",
+			format: "codex",
+			firstChunk: func(text string) []byte {
+				return []byte(`data: {"type":"response.output_text.delta","item_id":"item-1","output_index":0,"content_index":0,"delta":"` + text + `"}` + "\n\n")
+			},
+			secondChunk: func(text string) []byte {
+				return []byte(`data: {"type":"response.output_text.delta","item_id":"item-1","output_index":0,"content_index":0,"delta":"` + text + `"}` + "\n\n")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newPrivacySession()
+			marker := session.newMarker("test")
+			session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
+
+			first, firstDrop, firstCount := restorer.feed(test.firstChunk(marker[:14]))
+			if firstCount != 0 {
+				t.Fatalf("first content delta restored a complete marker: count=%d body=%q", firstCount, first)
+			}
+			if !firstDrop && strings.Contains(string(first), marker[:14]) {
+				t.Fatalf("partial marker leaked in the first valid SSE event: %q", first)
+			}
+
+			second, secondDrop, secondCount := restorer.feed(test.secondChunk(marker[14:]))
+			if secondDrop || secondCount != 1 || !strings.Contains(string(second), "person@example.com") {
+				t.Fatalf("split content-delta marker was not restored: drop=%v count=%d body=%q", secondDrop, secondCount, second)
+			}
+			if strings.Contains(string(second), marker) {
+				t.Fatalf("marker leaked after content-delta restoration: %q", second)
+			}
+		})
+	}
+}
+
+func TestStreamRestorerRestoresMarkerSplitAcrossToolArgumentDeltas(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string) []byte
+	}{
+		{
+			name:   "OpenAI tool arguments",
+			format: "openai",
+			chunk: func(text string) []byte {
+				return []byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"` + text + `"}}]},"finish_reason":null}]}` + "\n\n")
+			},
+		},
+		{
+			name:   "Claude partial JSON",
+			format: "claude",
+			chunk: func(text string) []byte {
+				return []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"` + text + `"}}` + "\n\n")
+			},
+		},
+		{
+			name:   "Codex function arguments",
+			format: "codex",
+			chunk: func(text string) []byte {
+				return []byte(`data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"` + text + `"}` + "\n\n")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newPrivacySession()
+			marker := session.newMarker("tool")
+			session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
+
+			first, _, _ := restorer.feed(test.chunk(marker[:17]))
+			if strings.Contains(string(first), marker[:17]) {
+				t.Fatalf("partial marker leaked in tool delta: %q", first)
+			}
+			second, drop, count := restorer.feed(test.chunk(marker[17:]))
+			if drop || count != 1 || !strings.Contains(string(second), "person@example.com") {
+				t.Fatalf("tool delta was not restored: drop=%v count=%d body=%q", drop, count, second)
+			}
+		})
+	}
+}
+
+func TestStreamRestorerEscapesWindowsPathInsideToolArgumentJSON(t *testing.T) {
+	type toolProtocol struct {
+		name    string
+		format  string
+		chunk   func(string) []byte
+		extract func([]byte) string
+	}
+	jsonString := func(value string) string {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	decodeEvent := func(chunk []byte) map[string]any {
+		line := chunk
+		if index := bytes.Index(line, []byte("data:")); index >= 0 {
+			line = line[index+len("data:"):]
+		}
+		line = bytes.TrimSpace(line)
+		var event map[string]any
+		if len(line) == 0 {
+			return event
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("decode restored event: %v\n%s", err, line)
+		}
+		return event
+	}
+	protocols := []toolProtocol{
+		{
+			name: "OpenAI tool arguments", format: "openai",
+			chunk: func(text string) []byte {
+				return []byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":` + jsonString(text) + `}}]} ,"finish_reason":null}]}` + "\n\n")
+			},
+			extract: func(chunk []byte) string {
+				event := decodeEvent(chunk)
+				if len(event) == 0 {
+					return ""
+				}
+				return event["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+			},
+		},
+		{
+			name: "Claude partial JSON", format: "claude",
+			chunk: func(text string) []byte {
+				return []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":` + jsonString(text) + `}}` + "\n\n")
+			},
+			extract: func(chunk []byte) string {
+				event := decodeEvent(chunk)
+				if len(event) == 0 {
+					return ""
+				}
+				return event["delta"].(map[string]any)["partial_json"].(string)
+			},
+		},
+		{
+			name: "Codex function arguments", format: "codex",
+			chunk: func(text string) []byte {
+				return []byte(`data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":` + jsonString(text) + `}` + "\n\n")
+			},
+			extract: func(chunk []byte) string {
+				event := decodeEvent(chunk)
+				if len(event) == 0 {
+					return ""
+				}
+				return event["delta"].(string)
+			},
+		},
+	}
+
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	for _, protocol := range protocols {
+		for split := 1; split < len(markerPrefix)+8; split++ {
+			t.Run(fmt.Sprintf("%s/split-%d", protocol.name, split), func(t *testing.T) {
+				session := newPrivacySession()
+				marker := session.newMarker("windows-path")
+				session.Mappings = []mapping{{Marker: marker, Original: windowsPath}}
+				restorer := &streamRestorer{session: session, adapter: adapterForFormat(protocol.format)}
+				innerPrefix := `{"command":"git fetch origin","description":"Fetch latest from remote","working_directory":"`
+				innerSuffix := `"}`
+				first, _, _ := restorer.feed(protocol.chunk(innerPrefix + marker[:split]))
+				second, drop, count := restorer.feed(protocol.chunk(marker[split:] + innerSuffix))
+				if drop || count != 1 {
+					t.Fatalf("restoration failed: drop=%v count=%d first=%q second=%q", drop, count, first, second)
+				}
+				innerJSON := protocol.extract(first) + protocol.extract(second)
+				var arguments map[string]any
+				if err := json.Unmarshal([]byte(innerJSON), &arguments); err != nil {
+					t.Fatalf("restored tool arguments are invalid JSON: %v\n%s", err, innerJSON)
+				}
+				if arguments["working_directory"] != windowsPath {
+					t.Fatalf("working_directory = %q, want %q", arguments["working_directory"], windowsPath)
+				}
+			})
+		}
+	}
+}
+
+func TestStreamRestorerLeavesClaudeSignedThinkingMarkersUntouched(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("signed-thinking")
+	session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	thinking := []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"` + marker + `"}}` + "\n\n")
+	restoredThinking, drop, count := restorer.feed(thinking)
+	if !drop || count != 0 || len(restoredThinking) != 0 {
+		t.Fatalf("signed thinking was not buffered: drop=%v count=%d body=%s", drop, count, restoredThinking)
+	}
+
+	signature := []byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signature-for-marker-text"}}` + "\n\n")
+	restoredSignature, drop, count := restorer.feed(signature)
+	if drop || count != 0 || !bytes.Contains(restoredSignature, []byte(marker)) || bytes.Contains(restoredSignature, []byte("person@example.com")) ||
+		!bytes.Contains(restoredSignature, []byte(`"signature":"signature-for-marker-text"`)) {
+		t.Fatalf("signature delta changed: drop=%v count=%d body=%s", drop, count, restoredSignature)
+	}
+}
+
+func TestStreamRestorerRestoresUnsignedClaudeThinkingAtBlockStop(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("unsigned-thinking")
+	session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	chunks := [][]byte{
+		[]byte(`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n"),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"email ` + marker + `"}}` + "\n\n"),
+		[]byte(`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":0}` + "\n\n"),
+	}
+	var output []byte
+	total := 0
+	for _, chunk := range chunks {
+		body, _, count := restorer.feed(chunk)
+		output = append(output, body...)
+		total += count
+	}
+	if total != 1 || !bytes.Contains(output, []byte("email person@example.com")) || bytes.Contains(output, []byte(marker)) {
+		t.Fatalf("unsigned thinking was not restored at block stop: count=%d body=%s", total, output)
+	}
+}
+
+func TestStreamRestorerKeepsSignedClaudeThinkingBufferedTextMasked(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("signed-thinking-sequence")
+	session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	chunks := [][]byte{
+		[]byte(`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n"),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"email ` + marker + `"}}` + "\n\n"),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signature-for-marker-text"}}` + "\n\n"),
+		[]byte(`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":0}` + "\n\n"),
+	}
+	var output []byte
+	total := 0
+	for _, chunk := range chunks {
+		body, _, count := restorer.feed(chunk)
+		output = append(output, body...)
+		total += count
+	}
+	if total != 0 || !bytes.Contains(output, []byte(marker)) || bytes.Contains(output, []byte("person@example.com")) || !bytes.Contains(output, []byte("signature-for-marker-text")) {
+		t.Fatalf("signed thinking was not kept atomically masked: count=%d body=%s", total, output)
+	}
+}
+
+func TestCodexCustomToolInputDeltaRestoresPlainText(t *testing.T) {
+	const windowsPath = `E:\repo\a.txt`
+	session := newPrivacySession()
+	marker := session.newMarker("custom-tool-path")
+	session.Mappings = []mapping{{Marker: marker, Original: windowsPath}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("codex")}
+
+	chunk := []byte(`data: {"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"*** Update File: ` + marker + `"}` + "\n\n")
+	restored, drop, count := restorer.feed(chunk)
+	if drop || count != 1 {
+		t.Fatalf("custom-tool restoration failed: drop=%v count=%d body=%s", drop, count, restored)
+	}
+	line := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(restored), []byte("data:")))
+	var event map[string]any
+	if err := json.Unmarshal(line, &event); err != nil {
+		t.Fatalf("restored custom-tool event is invalid JSON: %v\n%s", err, line)
+	}
+	if got := event["delta"]; got != "*** Update File: "+windowsPath {
+		t.Fatalf("custom-tool delta = %q, want raw text %q", got, "*** Update File: "+windowsPath)
+	}
+}
+
+func TestCodexCompleteFunctionCallEventsRestoreArgumentsJSON(t *testing.T) {
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	tests := []struct {
+		name    string
+		chunk   func(string) []byte
+		extract func(map[string]any) string
+	}{
+		{
+			name: "arguments done",
+			chunk: func(arguments string) []byte {
+				encoded, _ := json.Marshal(arguments)
+				return []byte(`data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":` + string(encoded) + `}` + "\n\n")
+			},
+			extract: func(event map[string]any) string { return event["arguments"].(string) },
+		},
+		{
+			name: "output item done",
+			chunk: func(arguments string) []byte {
+				encoded, _ := json.Marshal(arguments)
+				return []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":` + string(encoded) + `}}` + "\n\n")
+			},
+			extract: func(event map[string]any) string { return event["item"].(map[string]any)["arguments"].(string) },
+		},
+		{
+			name: "response completed",
+			chunk: func(arguments string) []byte {
+				encoded, _ := json.Marshal(arguments)
+				return []byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":` + string(encoded) + `}]}}` + "\n\n")
+			},
+			extract: func(event map[string]any) string {
+				return event["response"].(map[string]any)["output"].([]any)[0].(map[string]any)["arguments"].(string)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newPrivacySession()
+			marker := session.newMarker("complete-function-call")
+			session.Mappings = []mapping{{Marker: marker, Original: windowsPath}}
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat("codex")}
+			arguments := `{"working_directory":"` + marker + `"}`
+			restored, drop, count := restorer.feed(test.chunk(arguments))
+			if drop || count != 1 {
+				t.Fatalf("complete event restoration failed: drop=%v count=%d body=%s", drop, count, restored)
+			}
+			line := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(restored), []byte("data:")))
+			var event map[string]any
+			if err := json.Unmarshal(line, &event); err != nil {
+				t.Fatalf("restored event is invalid JSON: %v\n%s", err, line)
+			}
+			innerJSON := test.extract(event)
+			var inner map[string]any
+			if err := json.Unmarshal([]byte(innerJSON), &inner); err != nil {
+				t.Fatalf("restored arguments are invalid JSON: %v\n%s", err, innerJSON)
+			}
+			if inner["working_directory"] != windowsPath {
+				t.Fatalf("working_directory = %q, want %q", inner["working_directory"], windowsPath)
+			}
+		})
+	}
+}
+
+func TestStreamRestorerAutoDetectsRawClaudeDeltaBehindOpenAIFormat(t *testing.T) {
+	session := newPrivacySession()
+	marker := session.newMarker("translated-stream")
+	session.Mappings = []mapping{{Marker: marker, Original: "CPA_E2E_SECRET_REAL_STREAM"}}
+	// CPA can expose the original client format while the intercepted chunk is
+	// still a provider-native JSON event. The stream shape must be detected from
+	// the event itself instead of trusting only SourceFormat.
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("openai")}
+
+	first, _, _ := restorer.feed([]byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + marker[:1] + `"}}`))
+	if strings.Contains(string(first), marker[:1]) {
+		t.Fatalf("one-byte marker prefix leaked from raw Claude delta: %q", first)
+	}
+	second, drop, count := restorer.feed([]byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + marker[1:] + `"}}`))
+	if drop || count != 1 || !strings.Contains(string(second), "CPA_E2E_SECRET_REAL_STREAM") {
+		t.Fatalf("raw translated stream marker was not restored: drop=%v count=%d body=%q", drop, count, second)
+	}
+}
+
+func TestClaudeAndCodexStreamAdaptersRecognizeTheirTerminalEvents(t *testing.T) {
+	if !adapterForFormat("claude").StreamTerminal([]byte(`data: {"type":"message_stop"}`)) {
+		t.Fatal("Claude message_stop was not recognized")
+	}
+	if adapterForFormat("claude").StreamTerminal([]byte(`data: {"type":"content_block_delta"}`)) {
+		t.Fatal("Claude content delta was treated as terminal")
+	}
+	if !adapterForFormat("codex").StreamTerminal([]byte(`data: {"type":"response.completed"}`)) {
+		t.Fatal("Codex response.completed was not recognized")
+	}
+	if adapterForFormat("codex").StreamTerminal([]byte(`data: {"type":"response.output_text.delta"}`)) {
+		t.Fatal("Codex output delta was treated as terminal")
+	}
+}
+
+func TestEngineUsesCPARequestIDForIsolation(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := requestInterceptRequest{Model: "gpt-5", Body: []byte(`{"prompt":"person@example.com"}`), Metadata: map[string]any{cpaRequestIDMetadataKey: "req-1"}}
+	redacted, err := instance.interceptAfter(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := instance.interceptResponse(responseInterceptRequest{Model: "gpt-5", RequestBody: redacted.Body, Body: []byte(`{"answer":"` + markerFromBody(t, redacted.Body) + `"}`), Metadata: req.Metadata})
+	if !strings.Contains(string(response.Body), "person@example.com") {
+		t.Fatalf("response not restored: %s", response.Body)
+	}
+}
+
+func TestBuildPluginExposesOfficialSDKCapabilities(t *testing.T) {
+	plugin, err := buildPlugin([]byte("enabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plugin.Metadata.Name != "CPA Sensitive" || plugin.Metadata.Version != cpaSensitivePluginVersion {
+		t.Fatalf("unexpected plugin metadata: %#v", plugin.Metadata)
+	}
+	if plugin.Capabilities.RequestInterceptor == nil || plugin.Capabilities.ResponseInterceptor == nil || plugin.Capabilities.StreamChunkInterceptor == nil || plugin.Capabilities.ManagementAPI == nil {
+		t.Fatalf("official CPA capabilities are incomplete: %#v", plugin.Capabilities)
+	}
+	if _, ok := plugin.Capabilities.RequestInterceptor.(pluginapi.RequestInterceptor); !ok {
+		t.Fatalf("request interceptor does not implement pluginapi.RequestInterceptor: %T", plugin.Capabilities.RequestInterceptor)
+	}
+}
+
+func TestEngineEmitsSafeRedactionActivity(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Enabled = true
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []activityEvent
+	ctx := withActivityLogger(context.Background(), func(event activityEvent) {
+		events = append(events, event)
+	})
+	metadata := map[string]any{cpaRequestIDMetadataKey: "request-safe-log"}
+	request := requestInterceptRequest{
+		Model: "claude-haiku", SourceFormat: "codex", ToFormat: "claude",
+		Body:     []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"person@example.com"}]}]}`),
+		Metadata: metadata,
+	}
+	_, err = instance.interceptAfter(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("activity events = %d, want one redaction event", len(events))
+	}
+	if events[0].Stage != "request.redacted" || events[0].Count != 1 || events[0].RequestID != "request-safe-log" {
+		t.Fatalf("redaction activity = %#v", events[0])
+	}
+}
+
+func TestRPCForwardsSafeActivityToHostLogger(t *testing.T) {
+	shutdownEngine()
+	lifecycle, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(`enabled: true
+privacy_shield:
+  enabled: true
+  gitleaks: false
+  pii_enabled: true
+`)})
+	if _, err := handleMethod(methodRegister, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownEngine()
+
+	originalSender := hostLogSender
+	defer func() { hostLogSender = originalSender }()
+	var captured hostLogRequest
+	hostLogSender = func(payload []byte) ([]byte, error) {
+		if err := json.Unmarshal(payload, &captured); err != nil {
+			t.Fatal(err)
+		}
+		return []byte(`{"ok":true}`), nil
+	}
+
+	request, _ := json.Marshal(requestInterceptRPCRequest{
+		RequestInterceptRequest: requestInterceptRequest{
+			Model: "claude-haiku", SourceFormat: "codex", ToFormat: "claude",
+			Body:     []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"person@example.com"}]}]}`),
+			Metadata: map[string]any{cpaRequestIDMetadataKey: "request-host-log"},
+		},
+		HostCallbackID: "callback-safe-log",
+	})
+	if _, err := handleMethod(methodRequestAfter, request); err != nil {
+		t.Fatal(err)
+	}
+
+	if captured.HostCallbackID != "callback-safe-log" || captured.Message != "SensitivePromptMasker request.redacted count=1 source=codex target=claude stream=false" {
+		t.Fatalf("captured host log = %#v", captured)
+	}
+	if captured.Fields["count"] != float64(1) || captured.Fields["request_id"] != "request-host-log" {
+		t.Fatalf("captured host log fields = %#v", captured.Fields)
+	}
+	raw, _ := json.Marshal(captured)
+	if strings.Contains(string(raw), "person@example.com") || strings.Contains(string(raw), "CPA_RESTORE_SECRET_") {
+		t.Fatalf("host activity log leaked sensitive content: %s", raw)
+	}
+}
+
+func TestPrivacyShieldPreservesProtocolStructuralFields(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Phone = boolPointer(true)
+	cfg.Privacy.PII.UUID = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{
+  "model":"claude-haiku-4-5-20251001",
+  "context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+  "messages":[{"role":"user","content":"phone 20251015 email person@example.com"}],
+  "tools":[{"name":"lookup_20251015","input_schema":{"type":"object"}}],
+  "id":"3744369f-0055-4a7d-9d52-9065be04e5e4",
+  "call_id":"call_20251015"
+}`)
+	session, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	for _, structural := range []string{
+		`"model":"claude-haiku-4-5-20251001"`,
+		`"type":"clear_thinking_20251015"`,
+		`"role":"user"`,
+		`"name":"lookup_20251015"`,
+		`"type":"object"`,
+		`"id":"3744369f-0055-4a7d-9d52-9065be04e5e4"`,
+		`"call_id":"call_20251015"`,
+	} {
+		if !strings.Contains(text, structural) {
+			t.Fatalf("protocol structural field was modified: want %s in %s", structural, redacted)
+		}
+	}
+	if !strings.Contains(text, markerPrefix) || strings.Contains(text, "person@example.com") {
+		t.Fatalf("content field was not redacted: %s", redacted)
+	}
+	if len(session.Mappings) == 0 {
+		t.Fatal("content redaction produced no mappings")
+	}
+}
+
+func TestPrivacyShieldPreservesOpaqueAndToolReferenceFields(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Email = boolPointer(true)
+	cfg.Privacy.PII.GenericToken = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		toolName      = "mcp__nia__manage_resource_20260716"
+		thinkingSig   = "EqQBCgIYAhIM1v2OWHGt6N4LQxZ0LongThinkingSignature20260716"
+		redactedData  = "EqQBCgIYAhIMOpaqueRedactedThinkingPayload20260716"
+		base64Payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ20260716"
+	)
+	body := []byte(`{
+  "messages":[
+    {"role":"assistant","content":[
+      {"type":"thinking","thinking":"email person@example.com","signature":"` + thinkingSig + `"},
+      {"type":"redacted_thinking","data":"` + redactedData + `"}
+    ]},
+    {"role":"user","content":[
+      {"type":"tool_result","tool_use_id":"toolu_20260716","content":[
+        {"type":"tool_reference","tool_name":"` + toolName + `"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + base64Payload + `"}},
+        {"type":"text","text":"email result@example.com"}
+      ]}
+    ]}
+  ],
+  "tools":[{"name":"` + toolName + `","input_schema":{"type":"object"}}]
+}`)
+
+	session, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	for _, opaque := range []string{toolName, thinkingSig, redactedData, base64Payload} {
+		if !strings.Contains(text, opaque) {
+			t.Fatalf("opaque protocol value was modified: want %q in %s", opaque, redacted)
+		}
+	}
+	if !strings.Contains(text, "person@example.com") {
+		t.Fatalf("signed thinking text was modified: %s", redacted)
+	}
+	if strings.Contains(text, "result@example.com") {
+		t.Fatalf("tool-result text was not redacted: %s", redacted)
+	}
+	if len(session.Mappings) != 1 {
+		t.Fatalf("mapping count = %d, want only the unsigned tool-result email; mappings=%#v", len(session.Mappings), session.Mappings)
+	}
+}
+
+func TestPrivacyShieldPreservesSignedThinkingAndRedactsToolPayloadFields(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Email = boolPointer(true)
+	cfg.Privacy.PII.BankCard = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{
+  "messages":[{"role":"assistant","content":[
+    {"type":"thinking","thinking":"email signed@example.com","signature":"E-valid-signature"},
+    {"type":"tool_use","id":"toolu_1","name":"lookup","input":{
+      "name":"person@example.com",
+      "account_id":"4111111111111111",
+		"status":"result@example.com",
+		"fake_thinking":{"type":"thinking","signature":"business-signature","email":"fake-thinking@example.com"},
+		"record":{"type":"message","name":"record@example.com","account_id":"5555555555554444","status":"record-status@example.com"},
+		"fake_image":{"type":"input_image","image_url":"https://fake-image@example.com/private.png"}
+    }}
+  ]}]
+}`)
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	if !strings.Contains(text, "email signed@example.com") || !strings.Contains(text, "E-valid-signature") {
+		t.Fatalf("signed thinking block was modified: %s", redacted)
+	}
+	for _, sensitive := range []string{
+		"person@example.com", "4111111111111111", "result@example.com",
+		"fake-thinking@example.com", "record@example.com", "5555555555554444",
+		"record-status@example.com", "https://fake-image@example.com/private.png",
+	} {
+		if strings.Contains(text, sensitive) {
+			t.Fatalf("tool payload field was not redacted: %q in %s", sensitive, redacted)
+		}
+	}
+}
+
+func TestPrivacyShieldPreservesOpenAIMediaPayloads(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Privacy.Enabled = true
+	cfg.Privacy.Gitleaks = boolPointer(false)
+	cfg.Privacy.PIIEnabled = boolPointer(true)
+	cfg.Privacy.PII.Email = boolPointer(true)
+	cfg.Privacy.PII.GenericToken = boolPointer(true)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		imageURL  = "https://person@example.com/private.png"
+		fileData  = "data:application/pdf;base64,VGhpcy1pcy1hLWxvbmctZmlsZS1wYXlsb2FkLTIwMjYwNzE2"
+		chatData  = "data:image/png;base64,aVZCT1J3MEtHZ29BQUFBTlNVaEVVZ0FBQUFFQUFBQUJDQVlBQUFBZkZjU0oyMDI2MDcxNg=="
+		fileWrap  = "data:application/zip;base64,VGhpcy1pcy1hLW5lc3RlZC1maWxlLXdyYXBwZXItMjAyNjA3MTY="
+		audioData = "VGhpcy1pcy1uZXN0ZWQtYXVkaW8tZGF0YS0yMDI2MDcxNg=="
+		videoData = "data:video/mp4;base64,VGhpcy1pcy1uZXN0ZWQtdmlkZW8tZGF0YS0yMDI2MDcxNg=="
+	)
+	body := []byte(`{
+  "input":[{"type":"message","role":"user","content":[
+    {"type":"input_image","image_url":"` + imageURL + `"},
+    {"type":"input_file","file_data":"` + fileData + `","filename":"report.pdf"}
+  ]}],
+  "messages":[{"role":"user","content":[
+	{"type":"image_url","image_url":{"url":"` + chatData + `"}},
+	{"type":"file","file":{"file_data":"` + fileWrap + `","filename":"archive.zip"}},
+	{"type":"input_audio","input_audio":{"data":"` + audioData + `","format":"wav"}},
+	{"type":"video_url","video_url":{"url":"` + videoData + `"}}
+  ]}]
+}`)
+	_, redacted, err := redactJSON(context.Background(), body, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	for _, payload := range []string{imageURL, fileData, chatData, fileWrap, audioData, videoData} {
+		if !strings.Contains(text, payload) {
+			t.Fatalf("media payload was modified: want %q in %s", payload, redacted)
+		}
+	}
+}
+
+func TestRestoreJSONBytesEscapesWindowsPathInsideNonStreamToolArguments(t *testing.T) {
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	session := newPrivacySession()
+	marker := session.newMarker("path\x00" + windowsPath)
+	session.Mappings = append(session.Mappings, mapping{Marker: marker, Original: windowsPath, RuleID: "path"})
+
+	inner, err := json.Marshal(map[string]string{"working_directory": marker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"function": map[string]any{"arguments": string(inner)},
+				}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, count := restoreJSONBytes(body, session)
+	if count != 1 {
+		t.Fatalf("restore count = %d, want 1; body=%s", count, restored)
+	}
+	var outer map[string]any
+	if err := json.Unmarshal(restored, &outer); err != nil {
+		t.Fatalf("restored response is invalid JSON: %v\n%s", err, restored)
+	}
+	argumentsJSON := outer["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsJSON), &arguments); err != nil {
+		t.Fatalf("restored tool arguments are invalid JSON: %v\n%s", err, argumentsJSON)
+	}
+	if arguments["working_directory"] != windowsPath {
+		t.Fatalf("working_directory = %q, want %q", arguments["working_directory"], windowsPath)
+	}
+}
+
+func TestRestoreJSONBytesTreatsClaudeToolInputArgumentsAsPlainString(t *testing.T) {
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	session := newPrivacySession()
+	marker := session.newMarker("plain-tool-input")
+	session.Mappings = []mapping{{Marker: marker, Original: windowsPath}}
+	body := []byte(`{"content":[{"type":"tool_use","id":"toolu_1","name":"run","input":{"type":"function_call","arguments":"` + marker + `"}}]}`)
+
+	restored, count := restoreJSONBytes(body, session)
+	if count != 1 {
+		t.Fatalf("restore count = %d, want 1; body=%s", count, restored)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(restored, &root); err != nil {
+		t.Fatal(err)
+	}
+	got := root["content"].([]any)[0].(map[string]any)["input"].(map[string]any)["arguments"]
+	if got != windowsPath {
+		t.Fatalf("plain arguments field = %q, want %q", got, windowsPath)
+	}
+}
+
+func TestCodexResponseIncompleteIsTerminal(t *testing.T) {
+	if !adapterForFormat("codex").StreamTerminal([]byte(`data: {"type":"response.incomplete","response":{"status":"incomplete"}}`)) {
+		t.Fatal("Codex response.incomplete was not recognized as terminal")
+	}
+}
+
+func TestCodexResponseDoneIsTerminal(t *testing.T) {
+	if !adapterForFormat("codex").StreamTerminal([]byte(`data: {"type":"response.done","response":{"status":"completed"}}`)) {
+		t.Fatal("Codex response.done was not recognized as terminal")
+	}
+}
+
+func TestRPCRegistrationAndCodexRequestPath(t *testing.T) {
+	shutdownEngine()
+	lifecycle, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(`enabled: true
+sanitization:
+  enabled: true
+  replacement_groups:
+    - models: ["gpt-*"]
+      source_formats: ["codex"]
+      replacements:
+        - src: Claude Code
+          dst: client
+privacy_shield:
+  enabled: false
+`)})
+	raw, err := handleMethod(methodRegister, lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registered envelope
+	if err := json.Unmarshal(raw, &registered); err != nil || !registered.OK {
+		t.Fatalf("registration envelope invalid: err=%v raw=%s", err, raw)
+	}
+	var result registration
+	if err := json.Unmarshal(registered.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Capabilities.RequestInterceptor || !result.Capabilities.ResponseInterceptor || !result.Capabilities.StreamChunkInterceptor {
+		t.Fatalf("registration missing interceptor capabilities: %#v", result.Capabilities)
+	}
+	request, _ := json.Marshal(requestInterceptRequest{SourceFormat: "codex", Model: "gpt-5", Body: []byte(`{"instructions":"Claude Code"}`)})
+	raw, err = handleMethod(methodRequestBefore, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intercepted envelope
+	_ = json.Unmarshal(raw, &intercepted)
+	var response requestInterceptResponse
+	_ = json.Unmarshal(intercepted.Result, &response)
+	if !strings.Contains(string(response.Body), "client") {
+		t.Fatalf("Codex request did not pass through compatibility adapter: %s", response.Body)
+	}
+}
+
+func markerFromBody(t *testing.T, body []byte) string {
+	t.Helper()
+	start := strings.Index(string(body), markerPrefix)
+	if start < 0 {
+		t.Fatalf("marker missing: %s", body)
+	}
+	end := start + len(markerPrefix) + 32
+	return string(body[start:end])
+}
+
+func intPointer(value int) *int { return &value }

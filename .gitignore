@@ -1,0 +1,8 @@
+cpa-sensitive.so
+cpa-sensitive.dll
+cpa-sensitive.dylib
+cpa-sensitive.h
+dist/
+*.zip
+*.sha256
+checksums.txt
