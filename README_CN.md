@@ -316,14 +316,14 @@ go vet ./...
 构建当前平台动态库：
 
 ```bash
-make build VERSION=0.1.2
+make build VERSION=0.1.3
 ```
 
 或者直接：
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-  -ldflags "-s -w -X main.cpaSensitivePluginVersion=0.1.2" \
+  -ldflags "-s -w -X main.cpaSensitivePluginVersion=0.1.3" \
   -o cpa-sensitive.so .
 ```
 
