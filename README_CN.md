@@ -270,6 +270,16 @@ request-log: false
 
 正常的 `main.log` 和 Logs Viewer 可以继续使用。
 
+## `v0.1.2` 修了什么
+
+- 修复文件名、目录名和 `working_directory` 在工具调用中变成 marker 后无法恢复的问题；
+- session 关联同时使用 CPA request ID、`RequestBody`、`OriginalRequest` 和 body hash；
+- 即使 CPA 翻译或后置插件改写了请求 JSON，也能通过无歧义的 marker 映射找回正确 session；
+- 非流式结束、流式结束、TTL 和容量淘汰都会一次清理同一 session 的全部 alias；
+- 新 marker 改为纯字母数字 `CPAS...`，不含需要 JSON / shell 转义的特殊字符；
+- 恢复端继续兼容 `CPA_S_..._` 和 `CPA_RESTORE_SECRET_...` 旧格式；
+- Haiku 实机验证覆盖 OpenAI Chat、Claude Messages、Codex Responses 的非流式和流式工具参数，6/6 均发生真实脱敏与恢复，且没有 marker 泄漏。
+
 ## `v0.1.1` 修了什么
 
 - marker 跨请求、跨进程和 CPA 重启保持稳定，避免持续破坏 Claude prompt cache；
@@ -305,14 +315,14 @@ go vet ./...
 构建当前平台动态库：
 
 ```bash
-make build VERSION=0.1.1
+make build VERSION=0.1.2
 ```
 
 或者直接：
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-  -ldflags "-s -w -X main.cpaSensitivePluginVersion=0.1.1" \
+  -ldflags "-s -w -X main.cpaSensitivePluginVersion=0.1.2" \
   -o cpa-sensitive.so .
 ```
 
@@ -323,7 +333,7 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
 - 插件只能修改 CPA 官方 plugin ABI 暴露出来的请求和响应；CPA 在插件执行前已经写入的原始 request log 不受插件控制。
 - `privacy_shield` 保护的是经过 CPA 的模型请求，不等于磁盘全盘加密或客户端本地防泄漏。
 - 自动检测永远存在误报和漏报的可能，重要的内部格式建议增加 `custom_rules`。
-- 流式恢复依赖同一个请求生命周期内的 session 映射；CPA 重启后，已经在途的旧流无法继续恢复。
+- 流式恢复仍依赖进程内 session 映射；CPA 重启后，已经在途的旧流无法继续恢复。
 - `pii_aggressive: true` 不应在不了解误报范围时直接用于所有生产流量。
 
 ## 致谢

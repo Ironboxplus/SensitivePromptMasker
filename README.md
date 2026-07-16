@@ -166,7 +166,7 @@ go build -buildmode=c-shared -o cpa-sensitive.so .
 Use `.dll` on Windows and `.dylib` on macOS. The generated C header is not
 required at runtime.
 
-`make build VERSION=0.1.1` provides the same native build with release metadata.
+`make build VERSION=0.1.2` provides the same native build with release metadata.
 Pushing a `v*` tag runs the repository workflow, builds supported platform
 archives, writes SHA-256 files, and publishes a GitHub release.
 

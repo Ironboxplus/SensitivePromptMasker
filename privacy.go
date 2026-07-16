@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	markerPrefix       = "CPA_S_"
-	legacyMarkerPrefix = "CPA_RESTORE_SECRET_"
-	markerLead         = "CPA_"
+	markerPrefix              = "CPAS"
+	compactLegacyMarkerPrefix = "CPA_S_"
+	legacyMarkerPrefix        = "CPA_RESTORE_SECRET_"
+	markerLead                = "CPA"
 )
 
 var markerEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -425,7 +426,7 @@ func (s *privacySession) newMarker(key string) string {
 		s.markerKeys = make(map[string]string)
 	}
 	for digestBytes := 8; digestBytes <= len(digest); digestBytes += 4 {
-		marker := markerPrefix + markerEncoding.EncodeToString(digest[:digestBytes]) + "_"
+		marker := markerPrefix + markerEncoding.EncodeToString(digest[:digestBytes])
 		if existingKey, exists := s.markerKeys[marker]; !exists || existingKey == key {
 			s.markerKeys[marker] = key
 			return marker
@@ -760,8 +761,8 @@ func (s *privacySession) matchMarkerAt(body []byte, start int) (mapping, int, bo
 			}
 		}
 	}
-	if bytes.HasPrefix(remaining, []byte(markerPrefix)) {
-		for end := start + len(markerPrefix); end < len(body) && end-start <= s.maxMarkerLen; end++ {
+	if bytes.HasPrefix(remaining, []byte(compactLegacyMarkerPrefix)) {
+		for end := start + len(compactLegacyMarkerPrefix); end < len(body) && end-start <= s.maxMarkerLen; end++ {
 			char := body[end]
 			if char == '_' {
 				candidateEnd := end + 1
@@ -772,6 +773,16 @@ func (s *privacySession) matchMarkerAt(body []byte, start int) (mapping, int, bo
 			}
 			if !isMarkerBase32Char(char) {
 				break
+			}
+		}
+	}
+	if bytes.HasPrefix(remaining, []byte(markerPrefix)) {
+		for end := start + len(markerPrefix) + 1; end <= len(body) && end-start <= s.maxMarkerLen; end++ {
+			if !isMarkerBase32Char(body[end-1]) {
+				break
+			}
+			if item, ok := s.byMarker[string(body[start:end])]; ok {
+				return item, end, true
 			}
 		}
 	}
@@ -841,6 +852,25 @@ func (s *privacySession) possibleMarkerPrefix(remaining []byte) bool {
 			return true
 		}
 		for _, char := range suffix {
+			if !isMarkerBase32Char(byte(char)) {
+				return false
+			}
+		}
+		return true
+	}
+	oldCompactPrefix := []byte(compactLegacyMarkerPrefix)
+	if bytes.HasPrefix(oldCompactPrefix, remaining) {
+		return true
+	}
+	if bytes.HasPrefix(remaining, oldCompactPrefix) {
+		suffix := remaining[len(oldCompactPrefix):]
+		if len(suffix) == 0 {
+			return true
+		}
+		for _, char := range suffix {
+			if char == '_' {
+				return true
+			}
 			if !isMarkerBase32Char(byte(char)) {
 				return false
 			}

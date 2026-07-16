@@ -194,15 +194,7 @@ func TestPrivacyMarkerIsStableAcrossProcesses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marker subprocess failed: %v\n%s", err, output)
 		}
-		start := strings.Index(string(output), markerPrefix)
-		if start < 0 {
-			t.Fatalf("marker missing from subprocess output: %q", output)
-		}
-		end := strings.Index(string(output[start+len(markerPrefix):]), "_")
-		if end < 0 {
-			t.Fatalf("marker terminator missing from subprocess output: %q", output)
-		}
-		return string(output[start : start+len(markerPrefix)+end+1])
+		return markerFromBody(t, output)
 	}
 	first := run()
 	second := run()
@@ -464,11 +456,12 @@ func TestStreamRestorerRestoresMarkerSplitAcrossToolArgumentDeltas(t *testing.T)
 			session.Mappings = []mapping{{Marker: marker, Original: "person@example.com"}}
 			restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
 
-			first, _, _ := restorer.feed(test.chunk(marker[:17]))
-			if strings.Contains(string(first), marker[:17]) {
+			split := len(marker) / 2
+			first, _, _ := restorer.feed(test.chunk(marker[:split]))
+			if strings.Contains(string(first), marker[:split]) {
 				t.Fatalf("partial marker leaked in tool delta: %q", first)
 			}
-			second, drop, count := restorer.feed(test.chunk(marker[17:]))
+			second, drop, count := restorer.feed(test.chunk(marker[split:]))
 			if drop || count != 1 || !strings.Contains(string(second), "person@example.com") {
 				t.Fatalf("tool delta was not restored: drop=%v count=%d body=%q", drop, count, second)
 			}
@@ -778,6 +771,261 @@ func TestEngineUsesCPARequestIDForIsolation(t *testing.T) {
 	}
 }
 
+func TestEngineRestoresNonStreamToolArgumentsFromOriginalRequest(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	originalRequest, err := json.Marshal(map[string]any{
+		"messages": []any{map[string]any{
+			"role":    "user",
+			"content": "work in " + windowsPath,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat:   "claude",
+		ToFormat:       "claude",
+		Model:          "claude-opus-4-8",
+		RequestedModel: "model-dxt3al",
+		Body:           originalRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+	arguments, err := json.Marshal(map[string]any{
+		"command":           "git checkout -- main.tex",
+		"description":       "Revert main.tex to committed version",
+		"working_directory": marker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, err := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{
+			"index": 0,
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":      "Shell",
+						"arguments": string(arguments),
+					},
+				}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CPA may translate or otherwise rewrite the executed request after this
+	// plugin runs. OriginalRequest remains the only byte-identical callback
+	// field in that case.
+	response := instance.interceptResponse(responseInterceptRequest{
+		SourceFormat:    "openai",
+		Model:           "claude-opus-4-8",
+		RequestedModel:  "model-dxt3al",
+		OriginalRequest: originalRequest,
+		RequestBody:     []byte(`{"translated":true}`),
+		Body:            responseBody,
+	})
+	if bytes.Contains(response.Body, []byte(marker)) {
+		t.Fatalf("marker leaked from non-stream tool arguments: %s", response.Body)
+	}
+	var outer map[string]any
+	if err := json.Unmarshal(response.Body, &outer); err != nil {
+		t.Fatalf("restored response is invalid JSON: %v\n%s", err, response.Body)
+	}
+	argumentsJSON := outer["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	var restoredArguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsJSON), &restoredArguments); err != nil {
+		t.Fatalf("restored tool arguments are invalid JSON: %v\n%s", err, argumentsJSON)
+	}
+	if restoredArguments["working_directory"] != windowsPath {
+		t.Fatalf("working_directory = %q, want %q", restoredArguments["working_directory"], windowsPath)
+	}
+}
+
+func TestEngineRestoresNonStreamToolArgumentsByMarkerFallback(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	requestBody, _ := json.Marshal(map[string]string{"prompt": "work in " + windowsPath})
+	redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8", Body: requestBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+	arguments, _ := json.Marshal(map[string]string{"working_directory": marker})
+	responseBody, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"function": map[string]any{"name": "Shell", "arguments": string(arguments)},
+				}},
+			},
+		}},
+	})
+
+	response := instance.interceptResponse(responseInterceptRequest{
+		SourceFormat:    "openai",
+		Model:           "claude-opus-4-8",
+		OriginalRequest: []byte(`{"rewritten_original":true}`),
+		RequestBody:     []byte(`{"translated_request":true}`),
+		Body:            responseBody,
+	})
+	if bytes.Contains(response.Body, []byte(marker)) || !bytes.Contains(response.Body, []byte(`ARDLM-survey`)) {
+		t.Fatalf("marker fallback did not restore tool arguments: %s", response.Body)
+	}
+	if status := instance.status(); status.ActiveSessions != 0 || status.ActiveStreams != 0 {
+		t.Fatalf("completed response left stale aliases: %#v", status)
+	}
+}
+
+func TestEngineMarkerFallbackRefusesAmbiguousConcurrentSessions(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := newPrivacySession()
+	marker := first.newMarker("$/messages/0/content\x00pii-path\x000")
+	first.addMapping(mapping{Marker: marker, Original: `C:\Users\alice\secret`})
+	second := newPrivacySession()
+	secondMarker := second.newMarker("$/messages/0/content\x00pii-path\x000")
+	second.addMapping(mapping{Marker: secondMarker, Original: `C:\Users\bob\secret`})
+	if secondMarker != marker {
+		t.Fatalf("test requires a location-stable marker: first=%q second=%q", marker, secondMarker)
+	}
+	instance.storeSession(first, "request-alice")
+	instance.storeSession(second, "request-bob")
+
+	response := instance.interceptResponse(responseInterceptRequest{
+		Model:       "claude-opus-4-8",
+		RequestBody: []byte(`{"rewritten":true}`),
+		Body:        []byte(`{"working_directory":"` + marker + `"}`),
+	})
+	if !bytes.Contains(response.Body, []byte(marker)) || bytes.Contains(response.Body, []byte(`alice`)) || bytes.Contains(response.Body, []byte(`bob`)) {
+		t.Fatalf("ambiguous marker fallback restored the wrong session: %s", response.Body)
+	}
+}
+
+func TestEngineRestoresToolArgumentStreamsByMarkerFallback(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string) []byte
+		field  func(map[string]any) string
+	}{
+		{
+			name: "OpenAI Chat", format: "openai",
+			chunk: func(arguments string) []byte {
+				event, _ := json.Marshal(map[string]any{
+					"choices": []any{map[string]any{
+						"index": 0,
+						"delta": map[string]any{"tool_calls": []any{map[string]any{
+							"index": 0, "function": map[string]any{"arguments": arguments},
+						}}},
+						"finish_reason": nil,
+					}},
+				})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+			field: func(event map[string]any) string {
+				return event["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+			},
+		},
+		{
+			name: "Claude", format: "claude",
+			chunk: func(arguments string) []byte {
+				event, _ := json.Marshal(map[string]any{
+					"type": "content_block_delta", "index": 0,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": arguments},
+				})
+				return append(append([]byte("event: content_block_delta\ndata: "), event...), []byte("\n\n")...)
+			},
+			field: func(event map[string]any) string {
+				return event["delta"].(map[string]any)["partial_json"].(string)
+			},
+		},
+		{
+			name: "Codex Responses", format: "codex",
+			chunk: func(arguments string) []byte {
+				event, _ := json.Marshal(map[string]any{
+					"type": "response.function_call_arguments.delta", "item_id": "call-1", "output_index": 0, "delta": arguments,
+				})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+			field: func(event map[string]any) string { return event["delta"].(string) },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig()
+			instance, err := newEngine(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+			requestBody, _ := json.Marshal(map[string]string{"prompt": "work in " + windowsPath})
+			redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+				SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8", Body: requestBody,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := markerFromBody(t, redacted.Body)
+			arguments, _ := json.Marshal(map[string]string{"working_directory": marker})
+			chunk := test.chunk(string(arguments))
+			response := instance.interceptStream(streamChunkInterceptRequest{
+				SourceFormat:    test.format,
+				Model:           "claude-opus-4-8",
+				OriginalRequest: []byte(`{"rewritten_original":true}`),
+				RequestBody:     []byte(`{"translated_request":true}`),
+				Body:            chunk,
+				ChunkIndex:      0,
+			})
+			if response.DropChunk || bytes.Contains(response.Body, []byte(marker)) {
+				t.Fatalf("stream marker leaked or chunk dropped: drop=%v body=%s", response.DropChunk, response.Body)
+			}
+			dataIndex := bytes.Index(response.Body, []byte("data: "))
+			if dataIndex < 0 {
+				t.Fatalf("restored stream has no data event: %s", response.Body)
+			}
+			data := response.Body[dataIndex+len("data: "):]
+			if end := bytes.Index(data, []byte("\n")); end >= 0 {
+				data = data[:end]
+			}
+			var event map[string]any
+			if err := json.Unmarshal(data, &event); err != nil {
+				t.Fatalf("restored stream event is invalid JSON: %v\n%s", err, response.Body)
+			}
+			var restoredArguments map[string]string
+			if err := json.Unmarshal([]byte(test.field(event)), &restoredArguments); err != nil {
+				t.Fatalf("restored stream arguments are invalid JSON: %v\n%s", err, test.field(event))
+			}
+			if restoredArguments["working_directory"] != windowsPath {
+				t.Fatalf("working_directory = %q, want %q", restoredArguments["working_directory"], windowsPath)
+			}
+		})
+	}
+}
+
 func TestRequestInterceptorsMaskForwardedHost(t *testing.T) {
 	cfg := testConfig()
 	instance, err := newEngine(cfg)
@@ -910,7 +1158,8 @@ privacy_shield:
 		t.Fatalf("captured host log message lacks safe rule histogram: %q", captured.Message)
 	}
 	raw, _ := json.Marshal(captured)
-	if strings.Contains(string(raw), "person@example.com") || strings.Contains(string(raw), legacyMarkerPrefix) || strings.Contains(string(raw), markerPrefix) {
+	if strings.Contains(string(raw), "person@example.com") || strings.Contains(string(raw), legacyMarkerPrefix) ||
+		strings.Contains(string(raw), compactLegacyMarkerPrefix) || strings.Contains(string(raw), markerPrefix) {
 		t.Fatalf("host activity log leaked sensitive content: %s", raw)
 	}
 }
@@ -928,7 +1177,7 @@ func TestPrivacyMarkersAreCompactUniqueAndStableAcrossRetries(t *testing.T) {
 	if markerA == markerB {
 		t.Fatalf("different mappings share marker %q", markerA)
 	}
-	if !strings.HasPrefix(markerA, "CPA_S_") || !strings.HasPrefix(markerB, "CPA_S_") {
+	if !strings.HasPrefix(markerA, markerPrefix) || !strings.HasPrefix(markerB, markerPrefix) {
 		t.Fatalf("compact marker prefix missing: %q %q", markerA, markerB)
 	}
 
@@ -936,6 +1185,37 @@ func TestPrivacyMarkersAreCompactUniqueAndStableAcrossRetries(t *testing.T) {
 	markerOtherSession := second.newMarker("rule-a\x00secret-a")
 	if markerOtherSession != markerA {
 		t.Fatalf("same sensitive value changed marker across retries: first=%q second=%q", markerA, markerOtherSession)
+	}
+}
+
+func TestPrivacyMarkerUsesOnlyASCIIAlphanumericCharacters(t *testing.T) {
+	marker := newPrivacySession().newMarker("$/messages/0/content\x00pii-path\x000")
+	if marker == "" {
+		t.Fatal("marker is empty")
+	}
+	for _, char := range marker {
+		if (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		t.Fatalf("marker %q contains non-alphanumeric character %q", marker, char)
+	}
+}
+
+func TestRestoreSupportsPreviousMarkerFormats(t *testing.T) {
+	compactLegacy := compactLegacyMarkerPrefix + "ABCDEFGHIJKLM" + "_"
+	longLegacy := legacyMarkerPrefix + "0123456789abcdef0123456789abcdef"
+	session := newPrivacySession()
+	session.Mappings = []mapping{
+		{Marker: compactLegacy, Original: `d:\legacy\compact`},
+		{Marker: longLegacy, Original: `d:\legacy\long`},
+	}
+	body, _ := json.Marshal(map[string]string{
+		"compact": compactLegacy,
+		"long":    longLegacy,
+	})
+	restored, count := restoreJSONBytes(body, session)
+	if count != 2 || bytes.Contains(restored, []byte(compactLegacy)) || bytes.Contains(restored, []byte(longLegacy)) {
+		t.Fatalf("previous marker formats were not restored: count=%d body=%s", count, restored)
 	}
 }
 
@@ -1270,15 +1550,16 @@ func markerFromBody(t *testing.T, body []byte) string {
 	if start < 0 {
 		t.Fatalf("marker missing: %s", body)
 	}
-	markerBodyStart := start + len(markerPrefix)
-	if markerBodyStart >= len(body) {
+	end := start + len(markerPrefix)
+	if end >= len(body) {
 		t.Fatalf("compact marker is truncated: %s", body)
 	}
-	end := strings.Index(string(body[markerBodyStart:]), "_")
-	if end < 0 {
-		t.Fatalf("marker terminator missing: %s", body)
+	for end < len(body) && isMarkerBase32Char(body[end]) {
+		end++
 	}
-	end += markerBodyStart + 1
+	if end == start+len(markerPrefix) {
+		t.Fatalf("marker digest missing: %s", body)
+	}
 	return string(body[start:end])
 }
 
