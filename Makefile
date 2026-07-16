@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= cpa-sensitive
-VERSION ?= 0.1.3
+VERSION ?= 0.1.4
 BUILD_DIR ?= .
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

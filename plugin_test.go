@@ -210,7 +210,7 @@ func TestPrivacyMarkerSubprocessHelper(t *testing.T) {
 	fmt.Print(newPrivacySession().newMarker("/system/0/text\x00pii-email\x000"))
 }
 
-func TestPrivacyMarkerUsesLocationInsteadOfSecretValue(t *testing.T) {
+func TestPrivacyMarkerSeparatesDifferentSecretsAtSameLocation(t *testing.T) {
 	cfg := testConfig()
 	detector, err := newDetector(cfg.Privacy)
 	if err != nil {
@@ -224,8 +224,8 @@ func TestPrivacyMarkerUsesLocationInsteadOfSecretValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if markerFromBody(t, first) != markerFromBody(t, second) {
-		t.Fatalf("same JSON location produced a value-dependent marker: first=%s second=%s", first, second)
+	if markerFromBody(t, first) == markerFromBody(t, second) {
+		t.Fatalf("different secrets at the same JSON location share a marker: first=%s second=%s", first, second)
 	}
 }
 
@@ -966,31 +966,55 @@ func TestEngineRestoresNonStreamToolArgumentsByMarkerFallback(t *testing.T) {
 	}
 }
 
-func TestEngineMarkerFallbackRefusesAmbiguousConcurrentSessions(t *testing.T) {
+func TestEngineMarkerFallbackRestoresOverlappingSessions(t *testing.T) {
 	cfg := testConfig()
 	instance, err := newEngine(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := newPrivacySession()
-	marker := first.newMarker("$/messages/0/content\x00pii-path\x000")
-	first.addMapping(mapping{Marker: marker, Original: `C:\Users\alice\secret`})
-	second := newPrivacySession()
-	secondMarker := second.newMarker("$/messages/0/content\x00pii-path\x000")
-	second.addMapping(mapping{Marker: secondMarker, Original: `C:\Users\bob\secret`})
-	if secondMarker != marker {
-		t.Fatalf("test requires a location-stable marker: first=%q second=%q", marker, secondMarker)
+	detector, err := newDetector(cfg.Privacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody := []byte(`{"prompt":"C:\\Users\\alice\\secret"}`)
+	secondBody := []byte(`{"prompt":"C:\\Users\\bob\\secret"}`)
+	first, firstRedacted, err := redactJSON(context.Background(), firstBody, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondRedacted, err := redactJSON(context.Background(), secondBody, cfg.Privacy, detector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMarker := markerFromBody(t, firstRedacted)
+	secondMarker := markerFromBody(t, secondRedacted)
+	if firstMarker == secondMarker {
+		t.Fatalf("overlapping sessions share marker %q", firstMarker)
 	}
 	instance.storeSession(first, "request-alice")
 	instance.storeSession(second, "request-bob")
+	arguments, _ := json.Marshal(map[string]string{"working_directory": secondMarker})
+	event, _ := json.Marshal(map[string]any{
+		"type": "response.function_call_arguments.delta", "item_id": "call-bob", "output_index": 0, "delta": string(arguments),
+	})
+	streamResponse := instance.interceptStream(streamChunkInterceptRequest{
+		SourceFormat: "openai-response",
+		Model:        "claude-opus-4-8",
+		RequestBody:  []byte(`{"rewritten":true}`),
+		Body:         append(append([]byte("data: "), event...), []byte("\n\n")...),
+		ChunkIndex:   0,
+	})
+	if bytes.Contains(streamResponse.Body, []byte(secondMarker)) || bytes.Contains(streamResponse.Body, []byte(`alice`)) || !bytes.Contains(streamResponse.Body, []byte(`bob`)) {
+		t.Fatalf("stream marker fallback did not select the matching overlapping session: %s", streamResponse.Body)
+	}
 
 	response := instance.interceptResponse(responseInterceptRequest{
 		Model:       "claude-opus-4-8",
 		RequestBody: []byte(`{"rewritten":true}`),
-		Body:        []byte(`{"working_directory":"` + marker + `"}`),
+		Body:        []byte(`{"working_directory":"` + secondMarker + `"}`),
 	})
-	if !bytes.Contains(response.Body, []byte(marker)) || bytes.Contains(response.Body, []byte(`alice`)) || bytes.Contains(response.Body, []byte(`bob`)) {
-		t.Fatalf("ambiguous marker fallback restored the wrong session: %s", response.Body)
+	if bytes.Contains(response.Body, []byte(secondMarker)) || bytes.Contains(response.Body, []byte(`alice`)) || !bytes.Contains(response.Body, []byte(`bob`)) {
+		t.Fatalf("marker fallback did not select the matching overlapping session: %s", response.Body)
 	}
 }
 

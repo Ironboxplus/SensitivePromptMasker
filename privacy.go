@@ -396,7 +396,7 @@ func redactString(ctx context.Context, value, path string, maxFindings int, scan
 	last := 0
 	for findingIndex, item := range findings {
 		original := value[item.Start:item.End]
-		key := path + "\x00" + item.RuleID + "\x00" + strconv.Itoa(findingIndex)
+		key := path + "\x00" + item.RuleID + "\x00" + strconv.Itoa(findingIndex) + "\x00" + original
 		marker, exists := session.byKey[key]
 		if !exists {
 			if maxFindings > 0 && len(session.Mappings) >= maxFindings {
