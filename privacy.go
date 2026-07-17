@@ -650,11 +650,12 @@ type contentStreamRestorer struct {
 	session        *privacySession
 	buffers        map[string][]byte
 	claudeThinking map[string]*claudeThinkingState
+	claudeToolJSON map[string]*claudeToolJSONState
 }
 
 func newContentStreamRestorer(session *privacySession) *contentStreamRestorer {
 	restorer := &contentStreamRestorer{
-		session: session, buffers: make(map[string][]byte), claudeThinking: make(map[string]*claudeThinkingState),
+		session: session, buffers: make(map[string][]byte), claudeThinking: make(map[string]*claudeThinkingState), claudeToolJSON: make(map[string]*claudeToolJSONState),
 	}
 	if session == nil {
 		return restorer

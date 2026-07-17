@@ -44,6 +44,9 @@ func (chatAdapter) StreamTerminal(body []byte) bool {
 }
 
 func (chatAdapter) RestoreStreamChunk(body []byte, restorer *contentStreamRestorer) ([]byte, bool, int) {
+	if isClaudeContentBlockStream(body) {
+		return restoreClaudeStreamChunk(body, restorer)
+	}
 	return restoreKnownStreamChunk(body, restorer)
 }
 
@@ -101,7 +104,26 @@ func (codexAdapter) StreamTerminal(body []byte) bool {
 }
 
 func (codexAdapter) RestoreStreamChunk(body []byte, restorer *contentStreamRestorer) ([]byte, bool, int) {
+	if isClaudeContentBlockStream(body) {
+		return restoreClaudeStreamChunk(body, restorer)
+	}
 	return restoreKnownStreamChunk(body, restorer)
+}
+
+// CPA can report the client source format while forwarding a provider-native
+// stream. Detect Claude blocks from the event shape so tool JSON gets the same
+// block-level reconstruction even on translated Claude/OpenAI routes.
+func isClaudeContentBlockStream(body []byte) bool {
+	return bytes.Contains(body, []byte("content_block_"))
+}
+
+func isSSEStreamFrame(frame []byte) bool {
+	for _, rawLine := range bytes.Split(frame, []byte("\n")) {
+		if bytes.HasPrefix(bytes.TrimSpace(rawLine), []byte("data:")) {
+			return true
+		}
+	}
+	return false
 }
 
 func restoreKnownStreamChunk(body []byte, restorer *contentStreamRestorer) ([]byte, bool, int) {
@@ -240,6 +262,17 @@ type claudeThinkingState struct {
 	passthrough bool
 }
 
+// Claude emits tool parameters as a sequence of JSON fragments. Individual
+// fragments are not a valid tool argument and cannot safely carry a marker
+// across callbacks, so they are held only for the lifetime of that tool block
+// and emitted as one reconstructed input_json_delta at block stop.
+type claudeToolJSONState struct {
+	index      any
+	parts      []string
+	useSSE     bool
+	lineEnding string
+}
+
 func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]byte, bool, int) {
 	if restorer == nil {
 		return body, false, 0
@@ -268,10 +301,31 @@ func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]b
 				output = appendStreamFrame(output, frame)
 				continue
 			}
+			// The dynamic plugin API replaces one current payload at a time.
+			// Only native SSE framing can carry the reconstructed delta and its
+			// following block-stop event in that same payload. Bare provider JSON
+			// therefore keeps the established field-local fallback below rather
+			// than emitting two invalid concatenated JSON documents.
+			if blockType == "tool_use" && isSSEStreamFrame(frame) {
+				ensureClaudeToolJSONState(restorer, index, event["index"], frame)
+			}
 		case "content_block_delta":
 			delta, _ := event["delta"].(map[string]any)
 			deltaType, _ := delta["type"].(string)
 			switch deltaType {
+			case "input_json_delta":
+				partialJSON, ok := delta["partial_json"].(string)
+				if !ok {
+					break
+				}
+				if state := restorer.claudeToolJSON[index]; state != nil {
+					state.parts = append(state.parts, partialJSON)
+					handledAny = true
+					// A tool consumer must never receive a prefix such as
+					// {"path":"CPAS...": wait for content_block_stop to send a
+					// complete, restored JSON argument instead.
+					continue
+				}
 			case "thinking_delta":
 				state := ensureClaudeThinkingState(restorer, index)
 				handledAny = true
@@ -301,12 +355,24 @@ func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]b
 				continue
 			}
 		case "content_block_stop":
+			flushed := false
 			if state := restorer.claudeThinking[index]; state != nil {
 				handledAny = true
 				var count int
 				output, count = flushClaudeThinkingState(output, index, state, restorer)
 				totalCount += count
 				delete(restorer.claudeThinking, index)
+				flushed = true
+			}
+			if state := restorer.claudeToolJSON[index]; state != nil {
+				handledAny = true
+				var count int
+				output, count = flushClaudeToolJSONState(output, state, restorer)
+				totalCount += count
+				delete(restorer.claudeToolJSON, index)
+				flushed = true
+			}
+			if flushed {
 				output = appendStreamFrame(output, frame)
 				continue
 			}
@@ -324,6 +390,21 @@ func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]b
 					output, count = flushClaudeThinkingState(output, key, state, restorer)
 					totalCount += count
 					delete(restorer.claudeThinking, key)
+				}
+			}
+			if len(restorer.claudeToolJSON) != 0 {
+				handledAny = true
+				keys := make([]string, 0, len(restorer.claudeToolJSON))
+				for key := range restorer.claudeToolJSON {
+					keys = append(keys, key)
+				}
+				sort.Strings(keys)
+				for _, key := range keys {
+					state := restorer.claudeToolJSON[key]
+					var count int
+					output, count = flushClaudeToolJSONState(output, state, restorer)
+					totalCount += count
+					delete(restorer.claudeToolJSON, key)
 				}
 			}
 		}
@@ -354,12 +435,82 @@ func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]b
 }
 
 func ensureClaudeThinkingState(restorer *contentStreamRestorer, index string) *claudeThinkingState {
+	if restorer.claudeThinking == nil {
+		restorer.claudeThinking = make(map[string]*claudeThinkingState)
+	}
 	state := restorer.claudeThinking[index]
 	if state == nil {
 		state = &claudeThinkingState{}
 		restorer.claudeThinking[index] = state
 	}
 	return state
+}
+
+func ensureClaudeToolJSONState(restorer *contentStreamRestorer, key string, index any, frame []byte) *claudeToolJSONState {
+	if restorer.claudeToolJSON == nil {
+		restorer.claudeToolJSON = make(map[string]*claudeToolJSONState)
+	}
+	state := restorer.claudeToolJSON[key]
+	if state != nil {
+		return state
+	}
+	lineEnding := "\n"
+	if bytes.Contains(frame, []byte("\r\n")) {
+		lineEnding = "\r\n"
+	}
+	state = &claudeToolJSONState{
+		index:      index,
+		useSSE:     bytes.Contains(frame, []byte("data:")),
+		lineEnding: lineEnding,
+	}
+	restorer.claudeToolJSON[key] = state
+	return state
+}
+
+func flushClaudeToolJSONState(output []byte, state *claudeToolJSONState, restorer *contentStreamRestorer) ([]byte, int) {
+	if state == nil || len(state.parts) == 0 {
+		return output, 0
+	}
+	partialJSON := strings.Join(state.parts, "")
+	restored, count := restoreContentBytesWithMode([]byte(partialJSON), restorer.session, true)
+	frame, ok := encodeClaudeToolJSONDelta(state, string(restored))
+	if !ok {
+		return output, count
+	}
+	return appendStreamFrame(output, frame), count
+}
+
+func encodeClaudeToolJSONDelta(state *claudeToolJSONState, partialJSON string) ([]byte, bool) {
+	if state == nil {
+		return nil, false
+	}
+	event := map[string]any{
+		"type":  "content_block_delta",
+		"index": state.index,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": partialJSON,
+		},
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return nil, false
+	}
+	if !state.useSSE {
+		return payload, true
+	}
+	lineEnding := state.lineEnding
+	if lineEnding == "" {
+		lineEnding = "\n"
+	}
+	frame := make([]byte, 0, len(payload)+48)
+	frame = append(frame, "event: content_block_delta"...)
+	frame = append(frame, lineEnding...)
+	frame = append(frame, "data: "...)
+	frame = append(frame, payload...)
+	frame = append(frame, lineEnding...)
+	frame = append(frame, lineEnding...)
+	return frame, true
 }
 
 func flushClaudeThinkingState(output []byte, index string, state *claudeThinkingState, restorer *contentStreamRestorer) ([]byte, int) {
@@ -430,15 +581,13 @@ func nonEmptyByteParts(parts [][]byte) [][]byte {
 
 func decodeStreamFrameEvent(frame []byte) (map[string]any, bool) {
 	payload := bytes.TrimSpace(frame)
-	if bytes.Contains(payload, []byte("data:")) {
-		for _, line := range bytes.Split(payload, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
-			}
-			payload = bytes.TrimSpace(line[len("data:"):])
-			break
+	for _, rawLine := range bytes.Split(payload, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
 		}
+		payload = bytes.TrimSpace(line[len("data:"):])
+		break
 	}
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 		return nil, false

@@ -2576,6 +2576,121 @@ func TestClaudeContentBlockStartRestoresCompleteToolInput(t *testing.T) {
 	}
 }
 
+func TestClaudeToolJSONIsRebuiltOnlyAtBlockStop(t *testing.T) {
+	const originalPath = "C:\\Users\\alice\\private-project\\ann0.json"
+	session := newPrivacySession()
+	marker := session.newMarker("split-claude-tool-json")
+	session.Mappings = []mapping{{Marker: marker, Original: originalPath}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	makeSSE := func(event map[string]any) []byte {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(append([]byte("event: "+event["type"].(string)+"\ndata: "), encoded...), []byte("\n\n")...)
+	}
+	start := makeSSE(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{"type": "tool_use", "id": "toolu_path", "name": "inspect_path", "input": map[string]any{}},
+	})
+	if body, drop, count := restorer.feed(start); drop || count != 0 || !bytes.Contains(body, []byte("content_block_start")) {
+		t.Fatalf("tool start changed unexpectedly: drop=%v count=%d body=%s", drop, count, body)
+	}
+
+	parts := []string{"{\"path\":\"", marker[:6], marker[6:], "\"}"}
+	for _, part := range parts {
+		delta := makeSSE(map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": part},
+		})
+		body, drop, count := restorer.feed(delta)
+		if !drop || count != 0 || len(body) != 0 {
+			t.Fatalf("tool JSON delta escaped before block stop: part=%q drop=%v count=%d body=%s", part, drop, count, body)
+		}
+	}
+
+	stop := makeSSE(map[string]any{"type": "content_block_stop", "index": 0})
+	body, drop, count := restorer.feed(stop)
+	if drop || count != 1 {
+		t.Fatalf("tool JSON was not released at block stop: drop=%v count=%d body=%s", drop, count, body)
+	}
+	if bytes.Contains(body, []byte(marker)) || !bytes.Contains(body, []byte("content_block_stop")) {
+		t.Fatalf("tool JSON was not rebuilt/restored at block stop: %s", body)
+	}
+
+	var reconstructed struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type        string `json:"type"`
+			PartialJSON string `json:"partial_json"`
+		} `json:"delta"`
+	}
+	for _, frame := range splitStreamFrames(body) {
+		if !bytes.Contains(frame, []byte("content_block_delta")) {
+			continue
+		}
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			if bytes.HasPrefix(line, []byte("data: ")) {
+				if err := json.Unmarshal(line[len("data: "):], &reconstructed); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if reconstructed.Delta.Type != "input_json_delta" {
+		t.Fatalf("rebuilt tool JSON = %#v", reconstructed.Delta)
+	}
+	var toolArguments map[string]string
+	if err := json.Unmarshal([]byte(reconstructed.Delta.PartialJSON), &toolArguments); err != nil {
+		t.Fatalf("rebuilt tool JSON is invalid: %v; %q", err, reconstructed.Delta.PartialJSON)
+	}
+	if toolArguments["path"] != originalPath {
+		t.Fatalf("rebuilt tool path = %q, want %q", toolArguments["path"], originalPath)
+	}
+}
+
+func TestClaudeToolJSONUsesEventShapeBehindOtherSourceFormats(t *testing.T) {
+	for _, format := range []string{"openai", "openai-response", "codex"} {
+		t.Run(format, func(t *testing.T) {
+			const originalPath = "translated-provider-path"
+			session := newPrivacySession()
+			marker := session.newMarker("translated-tool-json-" + format)
+			session.Mappings = []mapping{{Marker: marker, Original: originalPath}}
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat(format)}
+			makeSSE := func(event map[string]any) []byte {
+				encoded, err := json.Marshal(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return append(append([]byte("event: "+event["type"].(string)+"\ndata: "), encoded...), []byte("\n\n")...)
+			}
+
+			start := makeSSE(map[string]any{
+				"type": "content_block_start", "index": 0,
+				"content_block": map[string]any{"type": "tool_use", "id": "toolu_translated", "name": "inspect_path", "input": map[string]any{}},
+			})
+			if _, drop, _ := restorer.feed(start); drop {
+				t.Fatal("translated Claude tool start was dropped")
+			}
+			for _, part := range []string{"{\"path\":\"", marker[:5], marker[5:], "\"}"} {
+				delta := makeSSE(map[string]any{
+					"type": "content_block_delta", "index": 0,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": part},
+				})
+				if body, drop, count := restorer.feed(delta); !drop || count != 0 || len(body) != 0 {
+					t.Fatalf("translated Claude tool delta escaped: drop=%v count=%d body=%s", drop, count, body)
+				}
+			}
+			stop := makeSSE(map[string]any{"type": "content_block_stop", "index": 0})
+			body, drop, count := restorer.feed(stop)
+			if drop || count != 1 || bytes.Contains(body, []byte(marker)) || !bytes.Contains(body, []byte(originalPath)) {
+				t.Fatalf("translated Claude tool JSON was not restored: drop=%v count=%d body=%s", drop, count, body)
+			}
+		})
+	}
+}
+
 func TestClaudeBundledStartAndDeltaRestoresToolInput(t *testing.T) {
 	const originalPath = `/c/Users/Arc/.claude/projects/example/memory`
 	session := newPrivacySession()
