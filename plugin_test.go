@@ -1056,6 +1056,123 @@ func TestEngineRequestIDIsolationForIdenticalConcurrentStreams(t *testing.T) {
 	}
 }
 
+func TestEnginePrefersCPARequestIDOverSharedClientRequestHeader(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedHeaders := http.Header{"X-Client-Request-Id": []string{"shared-agent-request"}}
+
+	start := func(requestID, original string) requestInterceptResponse {
+		body, marshalErr := json.Marshal(map[string]any{
+			"messages": []any{map[string]any{"role": "user", "content": original}},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		response, interceptErr := instance.interceptAfter(context.Background(), requestInterceptRequest{
+			SourceFormat: "claude",
+			ToFormat:     "claude",
+			Model:        "claude-sonnet-5",
+			Headers:      sharedHeaders,
+			Body:         body,
+			Metadata:     map[string]any{cpaRequestIDMetadataKey: requestID},
+		})
+		if interceptErr != nil {
+			t.Fatal(interceptErr)
+		}
+		return response
+	}
+
+	first := start("cpa-agent-1", `C:\private\agent-one\chunk0.json`)
+	second := start("cpa-agent-2", `C:\private\agent-two\chunk0.json`)
+	firstMarker := markerFromBody(t, first.Body)
+	secondMarker := markerFromBody(t, second.Body)
+	if firstMarker == secondMarker {
+		t.Fatalf("concurrent requests unexpectedly share marker %q", firstMarker)
+	}
+
+	response := instance.interceptResponse(responseInterceptRequest{
+		SourceFormat:   "claude",
+		Model:          "claude-sonnet-5",
+		RequestHeaders: sharedHeaders,
+		RequestBody:    first.Body,
+		Metadata:       map[string]any{cpaRequestIDMetadataKey: "cpa-agent-1"},
+		Body:           []byte(`{"content":[{"type":"tool_use","name":"Search","input":{"pattern":"**/` + firstMarker + `*"}}]}`),
+	})
+	if bytes.Contains(response.Body, []byte(firstMarker)) || !bytes.Contains(response.Body, []byte(`agent-one`)) {
+		t.Fatalf("shared client request header selected the wrong privacy session: %s", response.Body)
+	}
+}
+
+func TestEngineKeepsConcurrentStreamsIsolatedWhenClientRequestHeaderIsShared(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedHeaders := http.Header{"X-Client-Request-Id": []string{"shared-agent-request"}}
+
+	type activeRequest struct {
+		id       string
+		original string
+		body     []byte
+		marker   string
+	}
+	start := func(id, original string) activeRequest {
+		requestBody, marshalErr := json.Marshal(map[string]any{
+			"messages": []any{map[string]any{"role": "user", "content": original}},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		redacted, interceptErr := instance.interceptAfter(context.Background(), requestInterceptRequest{
+			SourceFormat: "claude", ToFormat: "claude", Model: "claude-sonnet-5",
+			Headers: sharedHeaders, Body: requestBody,
+			Metadata: map[string]any{cpaRequestIDMetadataKey: id},
+		})
+		if interceptErr != nil {
+			t.Fatal(interceptErr)
+		}
+		return activeRequest{id: id, original: original, body: redacted.Body, marker: markerFromBody(t, redacted.Body)}
+	}
+	initialize := func(request activeRequest) {
+		instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+			SourceFormat: "claude", Model: "claude-sonnet-5", RequestHeaders: sharedHeaders,
+			RequestBody: request.body, Metadata: map[string]any{cpaRequestIDMetadataKey: request.id},
+			ChunkIndex: -1,
+		})
+	}
+
+	first := start("cpa-agent-stream-1", `C:\private\agent-one\chunk0.json`)
+	second := start("cpa-agent-stream-2", `C:\private\agent-two\chunk0.json`)
+	initialize(first)
+	initialize(second)
+
+	event, marshalErr := json.Marshal(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use", "id": "toolu_search", "name": "Search",
+			"input": map[string]any{"pattern": "**/" + second.marker + "*"},
+		},
+	})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	chunk := append(append([]byte("event: content_block_start\ndata: "), event...), []byte("\n\n")...)
+	response := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-sonnet-5", RequestHeaders: sharedHeaders,
+		RequestBody: second.body, Metadata: map[string]any{cpaRequestIDMetadataKey: second.id},
+		Body: chunk, ChunkIndex: 0,
+	})
+	if response.DropChunk || bytes.Contains(response.Body, []byte(second.marker)) || !bytes.Contains(response.Body, []byte(`agent-two`)) {
+		t.Fatalf("shared client request header selected the wrong stream session: drop=%v body=%s", response.DropChunk, response.Body)
+	}
+	if bytes.Contains(response.Body, []byte(`agent-one`)) || bytes.Contains(response.Body, []byte(first.marker)) {
+		t.Fatalf("second stream received data from the first session: %s", response.Body)
+	}
+}
+
 func TestRequestHeaderLookupKeysDoNotAddOrChangeHeaders(t *testing.T) {
 	headers := http.Header{
 		"X-Client-Request-Id": []string{"client-request-123"},
@@ -1075,6 +1192,36 @@ func TestRequestHeaderLookupKeysDoNotAddOrChangeHeaders(t *testing.T) {
 	}
 	if got := maskForwardedHost(nil); got != nil {
 		t.Fatalf("nil request headers became custom upstream headers: %v", got)
+	}
+}
+
+func TestCPARequestIDRemainsInternalMetadata(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const requestID = "cpa-private-correlation-id"
+	response, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-sonnet-5",
+		Headers:  http.Header{"X-Client-Request-Id": []string{"client-visible-id"}},
+		Body:     []byte(`{"messages":[{"role":"user","content":"person@example.com"}]}`),
+		Metadata: map[string]any{cpaRequestIDMetadataKey: requestID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(response.Body, []byte(requestID)) {
+		t.Fatalf("cpa_request_id leaked into the provider body: %s", response.Body)
+	}
+	for name, values := range response.Headers {
+		if strings.EqualFold(name, cpaRequestIDMetadataKey) {
+			t.Fatalf("cpa_request_id became an upstream header: %v", response.Headers)
+		}
+		for _, value := range values {
+			if strings.Contains(value, requestID) {
+				t.Fatalf("cpa_request_id leaked into upstream header %q: %q", name, value)
+			}
+		}
 	}
 }
 
@@ -1986,6 +2133,39 @@ func TestRestoreJSONBytesTreatsClaudeToolInputArgumentsAsPlainString(t *testing.
 	got := root["content"].([]any)[0].(map[string]any)["input"].(map[string]any)["arguments"]
 	if got != windowsPath {
 		t.Fatalf("plain arguments field = %q, want %q", got, windowsPath)
+	}
+}
+
+func TestClaudeContentBlockStartRestoresCompleteToolInput(t *testing.T) {
+	const originalPattern = `**/private-project/chunk0*`
+	session := newPrivacySession()
+	marker := session.newMarker("complete-claude-tool-input")
+	session.Mappings = []mapping{{Marker: marker, Original: originalPattern}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	event, err := json.Marshal(map[string]any{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use",
+			"id":   "toolu_search",
+			"name": "Search",
+			"input": map[string]any{
+				"pattern": "**/" + marker + "*",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := append(append([]byte("event: content_block_start\ndata: "), event...), []byte("\n\n")...)
+
+	restored, drop, count := restorer.feed(chunk)
+	if drop || count != 1 {
+		t.Fatalf("complete Claude tool input was not restored: drop=%v count=%d body=%s", drop, count, restored)
+	}
+	if bytes.Contains(restored, []byte(marker)) || !bytes.Contains(restored, []byte(originalPattern)) {
+		t.Fatalf("complete Claude tool input leaked marker: %s", restored)
 	}
 }
 

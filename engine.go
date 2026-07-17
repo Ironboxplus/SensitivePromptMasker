@@ -200,11 +200,6 @@ func (e *engine) storeSession(session *privacySession, keys ...string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pruneLocked(now)
-	for _, key := range keys {
-		if entry, ok := e.sessions[key]; ok && entry.session != session {
-			e.deleteSessionLocked(entry.session)
-		}
-	}
 	if e.uniqueSessionCountLocked() >= e.cfg.Session.MaxSessions {
 		var oldestSession *privacySession
 		var oldest time.Time
@@ -241,15 +236,13 @@ func (e *engine) ensureStream(streamKeys, sessionKeys []string, format string, m
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pruneLocked(time.Now())
-	for _, key := range streamKeys {
-		if stream := e.streams[key]; stream != nil {
-			return stream
-		}
-	}
 	session := e.findSessionLocked(sessionKeys, markerPayloads...)
 	if session == nil {
 		return nil
 	}
+	// A client request header is only a compatibility alias and may be shared by
+	// concurrent Agent requests. Resolve the strong request-scoped session first,
+	// then reuse only a stream that belongs to that exact session.
 	for _, stream := range e.streams {
 		if stream != nil && stream.session == session {
 			return stream
@@ -439,13 +432,13 @@ func correlationLookupKeys(headers http.Header, metadata map[string]any, bodies 
 		seen[key] = struct{}{}
 		keys = append(keys, key)
 	}
-	for _, key := range requestHeaderLookupKeys(headers) {
-		add(key)
-	}
 	if metadata != nil {
 		if value, ok := metadata[cpaRequestIDMetadataKey].(string); ok {
 			add(strings.TrimSpace(value))
 		}
+	}
+	for _, key := range requestHeaderLookupKeys(headers) {
+		add(key)
 	}
 	for _, key := range sessionLookupKeys(nil, bodies, models...) {
 		add(key)
@@ -454,15 +447,19 @@ func correlationLookupKeys(headers http.Header, metadata map[string]any, bodies 
 }
 
 func correlationStoreKeys(headers http.Header, metadata map[string]any, bodies [][]byte, models ...string) []string {
-	if keys := requestHeaderLookupKeys(headers); len(keys) != 0 {
-		return keys[:1]
-	}
+	keys := make([]string, 0, 1+len(requestHeaderLookupKeys(headers)))
 	if metadata != nil {
 		if value, ok := metadata[cpaRequestIDMetadataKey].(string); ok {
 			if key := strings.TrimSpace(value); key != "" {
-				return []string{key}
+				keys = append(keys, key)
 			}
 		}
+	}
+	if headerKeys := requestHeaderLookupKeys(headers); len(headerKeys) != 0 {
+		keys = append(keys, headerKeys[0])
+	}
+	if len(keys) != 0 {
+		return keys
 	}
 	return sessionLookupKeys(nil, bodies, models...)
 }
