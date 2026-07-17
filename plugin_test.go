@@ -2169,6 +2169,46 @@ func TestClaudeContentBlockStartRestoresCompleteToolInput(t *testing.T) {
 	}
 }
 
+func TestClaudeBundledStartAndDeltaRestoresToolInput(t *testing.T) {
+	const originalPath = `/c/Users/Arc/.claude/projects/example/memory`
+	session := newPrivacySession()
+	marker := session.newMarker("bundled-claude-tool-start")
+	session.Mappings = []mapping{{Marker: marker, Original: originalPath}}
+	restorer := &streamRestorer{session: session, adapter: adapterForFormat("claude")}
+
+	start, err := json.Marshal(map[string]any{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use",
+			"id":   "toolu_bash",
+			"name": "Bash",
+			"input": map[string]any{
+				"command": `D="` + marker + `"; cat "$D/no-find-command.md"`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, err := json.Marshal(map[string]any{
+		"type": "content_block_delta", "index": 1,
+		"delta": map[string]any{"type": "text_delta", "text": "running command"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := append(append(append([]byte("event: content_block_start\ndata: "), start...), []byte("\n\n")...), append(append([]byte("event: content_block_delta\ndata: "), delta...), []byte("\n\n")...)...)
+
+	restored, drop, count := restorer.feed(bundle)
+	if drop || count != 1 {
+		t.Fatalf("bundled Claude tool input was not restored: drop=%v count=%d body=%s", drop, count, restored)
+	}
+	if bytes.Contains(restored, []byte(marker)) || !bytes.Contains(restored, []byte(originalPath)) {
+		t.Fatalf("bundled Claude content_block_start leaked marker: %s", restored)
+	}
+}
+
 func TestCodexResponseIncompleteIsTerminal(t *testing.T) {
 	if !adapterForFormat("codex").StreamTerminal([]byte(`data: {"type":"response.incomplete","response":{"status":"incomplete"}}`)) {
 		t.Fatal("Codex response.incomplete was not recognized as terminal")

@@ -417,8 +417,19 @@ func restoreOpenAIStreamEvent(event map[string]any, restorer *contentStreamResto
 func restoreClaudeStreamEvent(event map[string]any, restorer *contentStreamRestorer) (bool, int) {
 	eventType, _ := event["type"].(string)
 	if eventType == "content_block_start" {
-		if block, ok := event["content_block"].(map[string]any); ok && isOpaqueProtocolBlock(block) {
-			return true, 0
+		if block, ok := event["content_block"].(map[string]any); ok {
+			// Claude can put a complete tool_use input in content_block_start.
+			// CPA may deliver that frame together with a later delta in the same
+			// callback, so it must be restored here rather than relying on the
+			// whole-chunk JSON fallback.
+			if isOpaqueProtocolBlock(block) {
+				return true, 0
+			}
+			restored, count := restoreJSONValue(block, "content_block", restorer.session)
+			if updated, ok := restored.(map[string]any); ok {
+				event["content_block"] = updated
+			}
+			return true, count
 		}
 	}
 	index := streamValueKey(event["index"], 0)
