@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,10 @@ type engine struct {
 	mu       sync.Mutex
 	sessions map[string]sessionEntry
 	streams  map[string]*streamRestorer
+	// nextSessionKey creates a private storage alias for every redaction
+	// session. CPA's visible client request header is only a best-effort alias
+	// and may be reused before an earlier streaming response is complete.
+	nextSessionKey uint64
 
 	sanitizedReplacements atomic.Uint64
 	redactedMappings      atomic.Uint64
@@ -211,6 +216,11 @@ func (e *engine) storeSession(session *privacySession, keys ...string) {
 		e.deleteSessionLocked(oldestSession)
 	}
 	entry := sessionEntry{session: session, expiresAt: now.Add(time.Duration(e.cfg.Session.TTLSeconds) * time.Second)}
+	// Keep one plugin-private key per session in addition to externally derived
+	// aliases. A later request may overwrite a shared X-Client-Request-Id alias;
+	// retaining this entry lets a response marker resolve the older session.
+	e.nextSessionKey++
+	e.sessions["session-"+strconv.FormatUint(e.nextSessionKey, 10)] = entry
 	for _, key := range keys {
 		if key != "" {
 			e.sessions[key] = entry
@@ -258,12 +268,20 @@ func (e *engine) ensureStream(streamKeys, sessionKeys []string, format string, m
 }
 
 func (e *engine) findSessionLocked(keys []string, markerPayloads ...[]byte) *privacySession {
+	// A complete marker names one redaction mapping, not a conversation. It is
+	// stronger than a client header for restoration: Claude Code may reuse
+	// X-Client-Request-Id across Agent turns, while equal complete markers map
+	// to the same path/rule/value and therefore restore to the same original.
+	// Check it first whenever a response chunk carries one.
+	if session := e.findSessionByMarkersLocked(markerPayloads...); session != nil {
+		return session
+	}
 	for _, key := range keys {
 		if entry, ok := e.sessions[key]; ok && entry.session != nil {
 			return entry.session
 		}
 	}
-	return e.findSessionByMarkersLocked(markerPayloads...)
+	return nil
 }
 
 func (e *engine) findSessionByMarkersLocked(payloads ...[]byte) *privacySession {

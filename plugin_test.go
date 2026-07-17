@@ -1571,6 +1571,64 @@ func TestEngineMarkerFallbackRestoresOverlappingSessions(t *testing.T) {
 	}
 }
 
+// CPA does not currently inject cpa_request_id. Consequently, two real
+// Claude Code requests can have only the same reusable client header. The
+// second request must not evict the first request's marker table before the
+// first response has arrived.
+func TestEngineRetainsSupersededSharedHeaderSessionForMarkerRecovery(t *testing.T) {
+	cfg := testConfig()
+	instance, err := newEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sharedHeaders := http.Header{"X-Client-Request-Id": []string{"claude-code-shared-turn"}}
+	first, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8",
+		Headers: sharedHeaders, Body: []byte(`{"prompt":"inspect C:\\Users\\alice\\ann0.json"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8",
+		Headers: sharedHeaders, Body: []byte(`{"prompt":"inspect C:\\Users\\bob\\other.json"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMarker := markerFromBody(t, first.Body)
+	secondMarker := markerFromBody(t, second.Body)
+
+	event, err := json.Marshal(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use", "id": "toolu_listing", "name": "Bash",
+			"input": map[string]any{
+				"command": `ls -la "` + firstMarker + `/ann0.json" 2>/dev/null`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := append(append([]byte("event: content_block_start\ndata: "), event...), []byte("\n\n")...)
+	instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8", RequestHeaders: sharedHeaders,
+		RequestBody: []byte(`{"translated_request":true}`), ChunkIndex: -1,
+	})
+	response := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8", RequestHeaders: sharedHeaders,
+		RequestBody: []byte(`{"translated_request":true}`), Body: chunk, ChunkIndex: 0,
+	})
+	if response.DropChunk || bytes.Contains(response.Body, []byte(firstMarker)) || !bytes.Contains(response.Body, []byte(`C:\\Users\\alice\\ann0.json`)) {
+		t.Fatalf("superseded shared-header session was not recovered by marker: drop=%v body=%s", response.DropChunk, response.Body)
+	}
+	if bytes.Contains(response.Body, []byte(`C:\\Users\\bob\\other.json`)) || bytes.Contains(response.Body, []byte(secondMarker)) {
+		t.Fatalf("shared-header alias selected the newer session: %s", response.Body)
+	}
+}
+
 func TestEngineRestoresToolArgumentStreamsByMarkerFallback(t *testing.T) {
 	tests := []struct {
 		name   string
