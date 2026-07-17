@@ -86,12 +86,14 @@ func (e *engine) interceptAfter(ctx context.Context, request requestInterceptReq
 		return requestInterceptResponse{}, err
 	}
 	if len(session.Mappings) != 0 {
-		e.storeSession(session, sessionLookupKeys(
+		keys := correlationStoreKeys(
+			request.Headers,
 			request.Metadata,
 			[][]byte{sanitized, body},
 			request.Model,
 			request.RequestedModel,
-		)...)
+		)
+		e.storeSession(session, keys...)
 		e.redactedMappings.Add(uint64(len(session.Mappings)))
 		emitActivity(ctx, activityEvent{
 			Stage: "request.redacted", Model: request.Model, SourceFormat: request.SourceFormat,
@@ -125,7 +127,8 @@ func (e *engine) interceptResponse(request responseInterceptRequest) responseInt
 }
 
 func (e *engine) interceptResponseContext(ctx context.Context, request responseInterceptRequest) responseInterceptResponse {
-	keys := sessionLookupKeys(
+	keys := correlationLookupKeys(
+		request.RequestHeaders,
 		request.Metadata,
 		[][]byte{request.RequestBody, request.OriginalRequest},
 		request.Model,
@@ -149,18 +152,27 @@ func (e *engine) interceptStream(request streamChunkInterceptRequest) streamChun
 }
 
 func (e *engine) interceptStreamContext(ctx context.Context, request streamChunkInterceptRequest) streamChunkInterceptResponse {
-	keys := sessionLookupKeys(
+	bodies := [][]byte{request.RequestBody, request.OriginalRequest}
+	keys := correlationLookupKeys(
+		request.RequestHeaders,
 		request.Metadata,
-		[][]byte{request.RequestBody, request.OriginalRequest},
+		bodies,
+		request.Model,
+		request.RequestedModel,
+	)
+	streamKeys := correlationStoreKeys(
+		request.RequestHeaders,
+		request.Metadata,
+		bodies,
 		request.Model,
 		request.RequestedModel,
 	)
 	key := firstSessionKey(keys, request.Metadata, request.RequestBody, request.Model)
 	if request.ChunkIndex < 0 {
-		e.ensureStream(keys, request.SourceFormat, request.RequestBody, request.OriginalRequest)
+		e.ensureStream(streamKeys, keys, request.SourceFormat, request.RequestBody, request.OriginalRequest)
 		return streamChunkInterceptResponse{}
 	}
-	restorer := e.ensureStream(keys, request.SourceFormat, request.RequestBody, request.OriginalRequest, request.Body)
+	restorer := e.ensureStream(streamKeys, keys, request.SourceFormat, request.RequestBody, request.OriginalRequest, request.Body)
 	if restorer == nil {
 		return streamChunkInterceptResponse{Body: request.Body}
 	}
@@ -225,16 +237,16 @@ func (e *engine) takeSession(keys []string, remove bool, markerPayloads ...[]byt
 	return session
 }
 
-func (e *engine) ensureStream(keys []string, format string, markerPayloads ...[]byte) *streamRestorer {
+func (e *engine) ensureStream(streamKeys, sessionKeys []string, format string, markerPayloads ...[]byte) *streamRestorer {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pruneLocked(time.Now())
-	for _, key := range keys {
+	for _, key := range streamKeys {
 		if stream := e.streams[key]; stream != nil {
 			return stream
 		}
 	}
-	session := e.findSessionLocked(keys, markerPayloads...)
+	session := e.findSessionLocked(sessionKeys, markerPayloads...)
 	if session == nil {
 		return nil
 	}
@@ -244,7 +256,7 @@ func (e *engine) ensureStream(keys []string, format string, markerPayloads ...[]
 		}
 	}
 	stream := &streamRestorer{session: session, adapter: adapterForFormat(format)}
-	for _, key := range keys {
+	for _, key := range streamKeys {
 		if key != "" {
 			e.streams[key] = stream
 		}
@@ -410,6 +422,70 @@ func sessionLookupKeys(metadata map[string]any, bodies [][]byte, models ...strin
 				add(requestKey(nil, body, model))
 			}
 		}
+	}
+	return keys
+}
+
+func correlationLookupKeys(headers http.Header, metadata map[string]any, bodies [][]byte, models ...string) []string {
+	keys := make([]string, 0, 1+len(requestHeaderLookupKeys(headers))+len(bodies)*(1+len(models)))
+	seen := make(map[string]struct{})
+	add := func(key string) {
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, key := range requestHeaderLookupKeys(headers) {
+		add(key)
+	}
+	if metadata != nil {
+		if value, ok := metadata[cpaRequestIDMetadataKey].(string); ok {
+			add(strings.TrimSpace(value))
+		}
+	}
+	for _, key := range sessionLookupKeys(nil, bodies, models...) {
+		add(key)
+	}
+	return keys
+}
+
+func correlationStoreKeys(headers http.Header, metadata map[string]any, bodies [][]byte, models ...string) []string {
+	if keys := requestHeaderLookupKeys(headers); len(keys) != 0 {
+		return keys[:1]
+	}
+	if metadata != nil {
+		if value, ok := metadata[cpaRequestIDMetadataKey].(string); ok {
+			if key := strings.TrimSpace(value); key != "" {
+				return []string{key}
+			}
+		}
+	}
+	return sessionLookupKeys(nil, bodies, models...)
+}
+
+func requestHeaderLookupKeys(headers http.Header) []string {
+	if len(headers) == 0 {
+		return nil
+	}
+	names := [...]string{"X-Client-Request-Id"}
+	keys := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		value := strings.TrimSpace(headers.Get(name))
+		if value == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(strings.ToLower(name) + "\x00" + value))
+		key := "header-" + hex.EncodeToString(digest[:16])
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
 	return keys
 }

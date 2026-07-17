@@ -841,6 +841,412 @@ func TestEngineUsesCPARequestIDForIsolation(t *testing.T) {
 	}
 }
 
+func TestEngineUsesExistingRequestIDsAcrossRewrittenBodies(t *testing.T) {
+	type protocolCase struct {
+		name    string
+		format  string
+		event   func(string) map[string]any
+		extract func(map[string]any) string
+	}
+	protocols := []protocolCase{
+		{
+			name: "Claude partial JSON", format: "claude",
+			event: func(text string) map[string]any {
+				return map[string]any{
+					"type": "content_block_delta", "index": 0,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": text},
+				}
+			},
+			extract: func(event map[string]any) string {
+				return event["delta"].(map[string]any)["partial_json"].(string)
+			},
+		},
+		{
+			name: "Codex Responses function arguments", format: "openai-response",
+			event: func(text string) map[string]any {
+				return map[string]any{
+					"type": "response.function_call_arguments.delta", "item_id": "call-1",
+					"output_index": 0, "delta": text,
+				}
+			},
+			extract: func(event map[string]any) string { return event["delta"].(string) },
+		},
+		{
+			name: "OpenAI Chat tool arguments", format: "openai",
+			event: func(text string) map[string]any {
+				return map[string]any{
+					"choices": []any{map[string]any{
+						"index": 0, "finish_reason": nil,
+						"delta": map[string]any{"tool_calls": []any{map[string]any{
+							"index": 0, "function": map[string]any{"arguments": text},
+						}}},
+					}},
+				}
+			},
+			extract: func(event map[string]any) string {
+				return event["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+			},
+		},
+	}
+
+	for _, protocol := range protocols {
+		for _, sse := range []bool{false, true} {
+			mode := "raw JSON"
+			if sse {
+				mode = "SSE"
+			}
+			t.Run(protocol.name+"/"+mode, func(t *testing.T) {
+				instance, err := newEngine(testConfig())
+				if err != nil {
+					t.Fatal(err)
+				}
+				requestHeaders := http.Header{"X-Client-Request-Id": []string{"request-" + protocol.format}}
+				const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+				requestBody, err := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "work in " + windowsPath}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+					SourceFormat: protocol.format, ToFormat: protocol.format, Model: "test-model", Body: requestBody, Headers: requestHeaders,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if redacted.Headers.Get("X-Client-Request-Id") != requestHeaders.Get("X-Client-Request-Id") {
+					t.Fatalf("existing request ID changed: before=%v after=%v", requestHeaders, redacted.Headers)
+				}
+				marker := markerFromBody(t, redacted.Body)
+				changedOriginal := []byte(`{"body_changed_after_interception":true}`)
+				changedRequest := []byte(`{"provider_translated_body":true}`)
+				instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+					SourceFormat: protocol.format, Model: "test-model", OriginalRequest: changedOriginal,
+					RequestBody: changedRequest, RequestHeaders: redacted.Headers, ChunkIndex: -1,
+				})
+
+				arguments, err := json.Marshal(map[string]string{"working_directory": marker})
+				if err != nil {
+					t.Fatal(err)
+				}
+				split := bytes.Index(arguments, []byte(marker)) + len(marker)/2
+				makeChunk := func(text string) []byte {
+					encoded, marshalErr := json.Marshal(protocol.event(text))
+					if marshalErr != nil {
+						t.Fatal(marshalErr)
+					}
+					if !sse {
+						return encoded
+					}
+					return append(append([]byte("data: "), encoded...), []byte("\n\n")...)
+				}
+				first := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+					SourceFormat: protocol.format, Model: "test-model", OriginalRequest: changedOriginal,
+					RequestBody: changedRequest, RequestHeaders: redacted.Headers, Body: makeChunk(string(arguments[:split])), ChunkIndex: 0,
+				})
+				second := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+					SourceFormat: protocol.format, Model: "test-model", OriginalRequest: changedOriginal,
+					RequestBody: changedRequest, RequestHeaders: redacted.Headers, Body: makeChunk(string(arguments[split:])), ChunkIndex: 1,
+				})
+				if first.DropChunk || second.DropChunk {
+					t.Fatalf("request-scoped restoration dropped a tool delta: first=%v second=%v", first.DropChunk, second.DropChunk)
+				}
+				firstEvent, ok := decodeStreamFrameEvent(first.Body)
+				if !ok {
+					t.Fatalf("first restored event is invalid %s: %s", mode, first.Body)
+				}
+				secondEvent, ok := decodeStreamFrameEvent(second.Body)
+				if !ok {
+					t.Fatalf("second restored event is invalid %s: %s", mode, second.Body)
+				}
+				joined := protocol.extract(firstEvent) + protocol.extract(secondEvent)
+				if strings.Contains(joined, marker) || strings.Contains(joined, marker[:len(marker)/2]) {
+					t.Fatalf("privacy marker leaked into tool arguments: %s", joined)
+				}
+				var restoredArguments map[string]string
+				if err := json.Unmarshal([]byte(joined), &restoredArguments); err != nil {
+					t.Fatalf("restored tool arguments are invalid JSON: %v\n%s", err, joined)
+				}
+				if restoredArguments["working_directory"] != windowsPath {
+					t.Fatalf("working_directory = %q, want %q", restoredArguments["working_directory"], windowsPath)
+				}
+			})
+		}
+	}
+}
+
+func TestEngineRequestIDIsolationForIdenticalConcurrentStreams(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type activeRequest struct {
+		headers  http.Header
+		original string
+		marker   string
+		parts    [2]string
+	}
+	start := func(id, original string) activeRequest {
+		headers := http.Header{"X-Client-Request-Id": []string{"concurrent-" + id}}
+		requestBody, marshalErr := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": original}}})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		redacted, interceptErr := instance.interceptAfter(context.Background(), requestInterceptRequest{
+			SourceFormat: "claude", ToFormat: "claude", Model: "test-model", Body: requestBody, Headers: headers,
+		})
+		if interceptErr != nil {
+			t.Fatal(interceptErr)
+		}
+		marker := markerFromBody(t, redacted.Body)
+		arguments, marshalErr := json.Marshal(map[string]string{"value": marker})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		split := bytes.Index(arguments, []byte(marker)) + len(marker)/2
+		instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+			SourceFormat: "claude", Model: "test-model", OriginalRequest: []byte(`{"same":true}`),
+			RequestBody: []byte(`{"same":true}`), RequestHeaders: redacted.Headers, ChunkIndex: -1,
+		})
+		return activeRequest{headers: redacted.Headers, original: original, marker: marker, parts: [2]string{string(arguments[:split]), string(arguments[split:])}}
+	}
+	makeChunk := func(text string) []byte {
+		body, marshalErr := json.Marshal(map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": text},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	feed := func(request activeRequest, part, index int) string {
+		response := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+			SourceFormat: "claude", Model: "test-model", OriginalRequest: []byte(`{"same":true}`),
+			RequestBody: []byte(`{"same":true}`), RequestHeaders: request.headers, Body: makeChunk(request.parts[part]), ChunkIndex: index,
+		})
+		if response.DropChunk {
+			t.Fatalf("request %q part %d was dropped", request.original, part)
+		}
+		event, ok := decodeStreamFrameEvent(response.Body)
+		if !ok {
+			t.Fatalf("request %q part %d returned invalid JSON: %s", request.original, part, response.Body)
+		}
+		return event["delta"].(map[string]any)["partial_json"].(string)
+	}
+
+	first := start("first", "first.person@example.com")
+	second := start("second", "second.person@example.com")
+	firstJSON := feed(first, 0, 0)
+	secondJSON := feed(second, 0, 0)
+	firstJSON += feed(first, 1, 1)
+	secondJSON += feed(second, 1, 1)
+	for _, result := range []struct {
+		request activeRequest
+		body    string
+	}{{first, firstJSON}, {second, secondJSON}} {
+		if strings.Contains(result.body, first.marker) || strings.Contains(result.body, second.marker) {
+			t.Fatalf("request %q leaked or received a foreign marker: %s", result.request.original, result.body)
+		}
+		var arguments map[string]string
+		if err := json.Unmarshal([]byte(result.body), &arguments); err != nil {
+			t.Fatalf("request %q restored invalid JSON: %v\n%s", result.request.original, err, result.body)
+		}
+		if arguments["value"] != result.request.original {
+			t.Fatalf("request %q restored foreign value %q", result.request.original, arguments["value"])
+		}
+	}
+}
+
+func TestRequestHeaderLookupKeysDoNotAddOrChangeHeaders(t *testing.T) {
+	headers := http.Header{
+		"X-Client-Request-Id": []string{"client-request-123"},
+		"X-Custom-Existing":   []string{"keep-me"},
+		"Idempotency-Key":     []string{"reused-operation"},
+		"Traceparent":         []string{"reused-trace"},
+	}
+	prepared := maskForwardedHost(headers)
+	if len(prepared) != len(headers) || prepared.Get("X-Client-Request-Id") != "client-request-123" || prepared.Get("X-Custom-Existing") != "keep-me" {
+		t.Fatalf("request headers changed: before=%v after=%v", headers, prepared)
+	}
+	if len(requestHeaderLookupKeys(prepared)) != 1 {
+		t.Fatalf("request header lookup keys = %#v", requestHeaderLookupKeys(prepared))
+	}
+	if keys := requestHeaderLookupKeys(http.Header{"Idempotency-Key": []string{"same"}, "Traceparent": []string{"same"}}); len(keys) != 0 {
+		t.Fatalf("weak or reusable headers became session identities: %#v", keys)
+	}
+	if got := maskForwardedHost(nil); got != nil {
+		t.Fatalf("nil request headers became custom upstream headers: %v", got)
+	}
+}
+
+func TestEngineFallsBackToRequestBodyWhenResponseAddsRequestID(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	requestBody, err := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "work in " + windowsPath}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-haiku", Body: requestBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+	responseHeaders := http.Header{"X-Client-Request-Id": []string{"added-after-request-interceptor"}}
+	instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-haiku", RequestHeaders: responseHeaders,
+		OriginalRequest: redacted.Body, RequestBody: redacted.Body, ChunkIndex: -1,
+	})
+	arguments, err := json.Marshal(map[string]string{"working_directory": marker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	split := bytes.Index(arguments, []byte(marker)) + len(marker)/2
+	chunk := func(text string) []byte {
+		body, marshalErr := json.Marshal(map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": text},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	first := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-haiku", RequestHeaders: responseHeaders,
+		OriginalRequest: redacted.Body, RequestBody: redacted.Body, Body: chunk(string(arguments[:split])), ChunkIndex: 0,
+	})
+	second := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-haiku", RequestHeaders: responseHeaders,
+		OriginalRequest: redacted.Body, RequestBody: redacted.Body, Body: chunk(string(arguments[split:])), ChunkIndex: 1,
+	})
+	firstEvent, firstOK := decodeStreamFrameEvent(first.Body)
+	secondEvent, secondOK := decodeStreamFrameEvent(second.Body)
+	if first.DropChunk || second.DropChunk || !firstOK || !secondOK {
+		t.Fatalf("body fallback failed: first=%#v second=%#v", first, second)
+	}
+	joined := firstEvent["delta"].(map[string]any)["partial_json"].(string) + secondEvent["delta"].(map[string]any)["partial_json"].(string)
+	var restored map[string]string
+	if err := json.Unmarshal([]byte(joined), &restored); err != nil || restored["working_directory"] != windowsPath {
+		t.Fatalf("body fallback restored invalid arguments: err=%v body=%s", err, joined)
+	}
+}
+
+func TestRPCRequestIDCorrelationSurvivesCallbackContextRecreation(t *testing.T) {
+	shutdownEngine()
+	lifecycle, err := json.Marshal(lifecycleRequest{ConfigYAML: []byte(`enabled: true
+privacy_shield:
+  enabled: true
+  gitleaks: false
+  pii_enabled: true
+`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handleMethod(methodRegister, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownEngine()
+	originalSender := hostLogSender
+	hostLogSender = func([]byte) ([]byte, error) { return []byte(`{"ok":true}`), nil }
+	defer func() { hostLogSender = originalSender }()
+
+	const windowsPath = `d:\OneDrive\paper\ARDLM-survey`
+	requestBody, err := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "work in " + windowsPath}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := http.Header{"X-Client-Request-Id": []string{"rpc-client-request-1"}}
+	requestRPC, err := json.Marshal(requestInterceptRPCRequest{
+		RequestInterceptRequest: requestInterceptRequest{
+			SourceFormat: "claude", ToFormat: "claude", Model: "claude-haiku", Headers: headers, Body: requestBody,
+			Metadata: map[string]any{cpaRequestIDMetadataKey: "request-only-metadata-id"},
+		},
+		HostCallbackID: "callback-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleMethod(methodRequestAfter, requestRPC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestEnvelope envelope
+	if err := json.Unmarshal(raw, &requestEnvelope); err != nil || !requestEnvelope.OK {
+		t.Fatalf("request RPC failed: err=%v raw=%s", err, raw)
+	}
+	var redacted requestInterceptResponse
+	if err := json.Unmarshal(requestEnvelope.Result, &redacted); err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+	changedOriginal := []byte(`{"body_changed_after_interception":true}`)
+	changedRequest := []byte(`{"provider_translated_body":true}`)
+	callStream := func(callbackID string, body []byte, chunkIndex int) streamChunkInterceptResponse {
+		t.Helper()
+		request, marshalErr := json.Marshal(streamChunkInterceptRPCRequest{
+			StreamChunkInterceptRequest: streamChunkInterceptRequest{
+				SourceFormat: "claude", Model: "claude-haiku", RequestHeaders: redacted.Headers,
+				OriginalRequest: changedOriginal, RequestBody: changedRequest, Body: body, ChunkIndex: chunkIndex,
+			},
+			HostCallbackID: callbackID,
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		responseRaw, callErr := handleMethod(methodResponseStream, request)
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+		var responseEnvelope envelope
+		if unmarshalErr := json.Unmarshal(responseRaw, &responseEnvelope); unmarshalErr != nil || !responseEnvelope.OK {
+			t.Fatalf("stream RPC failed: err=%v raw=%s", unmarshalErr, responseRaw)
+		}
+		var response streamChunkInterceptResponse
+		if unmarshalErr := json.Unmarshal(responseEnvelope.Result, &response); unmarshalErr != nil {
+			t.Fatal(unmarshalErr)
+		}
+		return response
+	}
+	callStream("callback-init", nil, -1)
+	arguments, err := json.Marshal(map[string]string{"working_directory": marker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	split := bytes.Index(arguments, []byte(marker)) + len(marker)/2
+	makeChunk := func(text string) []byte {
+		body, marshalErr := json.Marshal(map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": text},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	first := callStream("callback-chunk-1", makeChunk(string(arguments[:split])), 0)
+	second := callStream("callback-chunk-2", makeChunk(string(arguments[split:])), 1)
+	if first.DropChunk || second.DropChunk {
+		t.Fatalf("RPC restoration dropped a chunk: first=%v second=%v", first.DropChunk, second.DropChunk)
+	}
+	firstEvent, firstOK := decodeStreamFrameEvent(first.Body)
+	secondEvent, secondOK := decodeStreamFrameEvent(second.Body)
+	if !firstOK || !secondOK {
+		t.Fatalf("RPC restoration returned invalid provider JSON: first=%s second=%s", first.Body, second.Body)
+	}
+	joined := firstEvent["delta"].(map[string]any)["partial_json"].(string) + secondEvent["delta"].(map[string]any)["partial_json"].(string)
+	var restoredArguments map[string]string
+	if err := json.Unmarshal([]byte(joined), &restoredArguments); err != nil {
+		t.Fatalf("RPC restored invalid tool JSON: %v\n%s", err, joined)
+	}
+	if restoredArguments["working_directory"] != windowsPath || strings.Contains(joined, marker) {
+		t.Fatalf("RPC restoration failed: %s", joined)
+	}
+}
+
 func TestEngineRestoresNonStreamToolArgumentsFromOriginalRequest(t *testing.T) {
 	cfg := testConfig()
 	instance, err := newEngine(cfg)
