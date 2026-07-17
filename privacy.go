@@ -822,6 +822,21 @@ func partialMarkerStart(body []byte, session *privacySession) int {
 	if session.maxMarkerLen <= 1 {
 		return len(body)
 	}
+	// A complete marker may itself end in C, P, A, or S. Those bytes are also
+	// prefixes of "CPAS", so checking only suffix shape would incorrectly keep
+	// the final byte buffered and turn a complete marker into an unmatchable
+	// truncated one. A complete marker ending at this boundary always wins.
+	for offset := 0; offset < len(body); {
+		relative := bytes.Index(body[offset:], []byte(markerLead))
+		if relative < 0 {
+			break
+		}
+		start := offset + relative
+		if _, end, ok := session.matchMarkerAt(body, start); ok && end == len(body) {
+			return len(body)
+		}
+		offset = start + len(markerLead)
+	}
 	dangerStart := len(body) - (session.maxMarkerLen - 1)
 	if dangerStart < 0 {
 		dangerStart = 0

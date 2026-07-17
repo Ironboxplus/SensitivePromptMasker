@@ -425,6 +425,74 @@ func TestContentStreamRestorerDoesNotBufferNonMarkerCPAText(t *testing.T) {
 	}
 }
 
+func TestContentStreamRestorerDoesNotSplitCompleteMarkerEndingInPrefix(t *testing.T) {
+	for _, tail := range []byte{'C', 'P', 'A', 'S'} {
+		t.Run(string(tail), func(t *testing.T) {
+			session := newPrivacySession()
+			marker := markerPrefix + "AAAAAAAABBBB" + string(tail)
+			session.addMapping(mapping{Marker: marker, Original: "restored-" + string(tail)})
+			restorer := newContentStreamRestorer(session)
+
+			if safe := partialMarkerStart([]byte(marker), session); safe != len(marker) {
+				t.Fatalf("complete marker ending in %q was retained as a prefix: safe=%d marker=%q", tail, safe, marker)
+			}
+			out, count := restorer.feed("text", marker)
+			if count != 1 || out != "restored-"+string(tail) {
+				t.Fatalf("complete marker ending in %q was not restored: count=%d out=%q", tail, count, out)
+			}
+			if len(restorer.buffers) != 0 {
+				t.Fatalf("complete marker ending in %q left an unread carry buffer: %#v", tail, restorer.buffers)
+			}
+		})
+	}
+}
+
+func TestKnownProtocolFieldsRestoreCompleteMarkerEndingInPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string) []byte
+	}{
+		{
+			name: "Claude partial JSON", format: "claude",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": value}})
+				return append(append([]byte("event: content_block_delta\ndata: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "OpenAI Chat arguments", format: "openai",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "function": map[string]any{"arguments": value}}}}, "finish_reason": nil}}})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "Codex Responses arguments", format: "openai-response",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "response.function_call_arguments.delta", "item_id": "call-1", "output_index": 0, "delta": value})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		for _, tail := range []byte{'C', 'P', 'A', 'S'} {
+			t.Run(test.name+"/"+string(tail), func(t *testing.T) {
+				session := newPrivacySession()
+				marker := markerPrefix + "AAAAAAAABBBB" + string(tail)
+				session.addMapping(mapping{Marker: marker, Original: "private-project/ann0.json"})
+				restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
+
+				output, drop, count := restorer.feed(test.chunk(marker))
+				if drop || count != 1 || bytes.Contains(output, []byte(marker)) || !bytes.Contains(output, []byte("private-project/ann0.json")) {
+					t.Fatalf("complete marker ending in %q leaked from %s: drop=%v count=%d body=%s", tail, test.name, drop, count, output)
+				}
+			})
+		}
+	}
+}
+
 func TestStreamRestorerRestoresMarkerSplitAcrossProtocolContentDeltas(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1514,8 +1582,8 @@ func TestEngineRestoresNonStreamToolArgumentsByMarkerFallback(t *testing.T) {
 	if bytes.Contains(response.Body, []byte(marker)) || !bytes.Contains(response.Body, []byte(`ARDLM-survey`)) {
 		t.Fatalf("marker fallback did not restore tool arguments: %s", response.Body)
 	}
-	if status := instance.status(); status.ActiveSessions != 0 || status.ActiveStreams != 0 {
-		t.Fatalf("completed response left stale aliases: %#v", status)
+	if status := instance.status(); status.ActiveSessions != 1 || status.ActiveStreams != 0 {
+		t.Fatalf("completed response did not retain only its bounded marker cache: %#v", status)
 	}
 }
 
@@ -1626,6 +1694,287 @@ func TestEngineRetainsSupersededSharedHeaderSessionForMarkerRecovery(t *testing.
 	}
 	if bytes.Contains(response.Body, []byte(`C:\\Users\\bob\\other.json`)) || bytes.Contains(response.Body, []byte(secondMarker)) {
 		t.Fatalf("shared-header alias selected the newer session: %s", response.Body)
+	}
+}
+
+// A leaked marker can be replayed by Claude Code in a later turn's history.
+// message_stop must release stream/header state without discarding the bounded
+// mapping cache needed to repair that replay.
+func TestEngineRestoresMarkerReplayedAfterCompletedClaudeStream(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := http.Header{"X-Client-Request-Id": []string{"claude-code-turn-one"}}
+	redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8",
+		Headers: headers, Body: []byte(`{"prompt":"inspect C:\\Users\\alice\\ann0.json"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+
+	terminal := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8", RequestHeaders: headers,
+		RequestBody: redacted.Body, Body: []byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), ChunkIndex: 1,
+	})
+	if terminal.DropChunk {
+		t.Fatal("message_stop was unexpectedly dropped")
+	}
+
+	event, err := json.Marshal(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use", "id": "toolu_replay", "name": "Bash",
+			"input": map[string]any{"command": `ls -la "` + marker + `/ann0.json"`},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8",
+		RequestHeaders: http.Header{"X-Client-Request-Id": []string{"claude-code-turn-two"}},
+		RequestBody:    []byte(`{"next_turn":true}`),
+		Body:           append(append([]byte("event: content_block_start\ndata: "), event...), []byte("\n\n")...),
+		ChunkIndex:     0,
+	})
+	if replayed.DropChunk || bytes.Contains(replayed.Body, []byte(marker)) || !bytes.Contains(replayed.Body, []byte(`C:\\Users\\alice\\ann0.json`)) {
+		t.Fatalf("replayed marker was not restored after message_stop: drop=%v body=%s", replayed.DropChunk, replayed.Body)
+	}
+}
+
+func TestEngineRestoresMarkerReplayedAfterCompletedNonStreamResponse(t *testing.T) {
+	instance, err := newEngine(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody, err := json.Marshal(map[string]string{"prompt": "contact alice@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := http.Header{"X-Client-Request-Id": []string{"claude-code-nonstream-one"}}
+	redacted, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+		SourceFormat: "claude", ToFormat: "claude", Model: "claude-opus-4-8", Headers: headers, Body: firstBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := markerFromBody(t, redacted.Body)
+	firstResponseBody, err := json.Marshal(map[string]string{"result": marker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResponse := instance.interceptResponse(responseInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8", RequestHeaders: headers, RequestBody: redacted.Body, Body: firstResponseBody,
+	})
+	if bytes.Contains(firstResponse.Body, []byte(marker)) || !bytes.Contains(firstResponse.Body, []byte("alice@example.com")) {
+		t.Fatalf("first non-stream response was not restored: %s", firstResponse.Body)
+	}
+
+	replayedBody, err := json.Marshal(map[string]string{"result": marker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRequestBody, err := json.Marshal(map[string]bool{"next_turn": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := instance.interceptResponse(responseInterceptRequest{
+		SourceFormat: "claude", Model: "claude-opus-4-8",
+		RequestHeaders: http.Header{"X-Client-Request-Id": []string{"claude-code-nonstream-two"}},
+		RequestBody:    nextRequestBody,
+		Body:           replayedBody,
+	})
+	if bytes.Contains(replayed.Body, []byte(marker)) || !bytes.Contains(replayed.Body, []byte("alice@example.com")) {
+		t.Fatalf("replayed marker was not restored after non-stream completion: %s", replayed.Body)
+	}
+	if status := instance.status(); status.ActiveSessions != 1 || status.ActiveStreams != 0 {
+		t.Fatalf("non-stream replay cache did not retain exactly one session: %#v", status)
+	}
+}
+
+// CPA supplies the executed request payload on every stream callback. That
+// body is the only request-unique correlation signal available to a dynamic
+// plugin when Claude Code reuses X-Client-Request-Id.
+func TestEngineUsesRequestBodyBeforeSharedHeaderForAllStreamProtocols(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string, int) []byte
+	}{
+		{
+			name: "Claude input JSON", format: "claude",
+			chunk: func(value string, index int) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": value}})
+				return append(append([]byte("event: content_block_delta\ndata: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "OpenAI Chat arguments", format: "openai",
+			chunk: func(value string, index int) []byte {
+				event, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "function": map[string]any{"arguments": value}}}}, "finish_reason": nil}}})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "Codex Responses arguments", format: "openai-response",
+			chunk: func(value string, index int) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "response.function_call_arguments.delta", "item_id": "call-1", "output_index": 0, "delta": value})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			instance, err := newEngine(testConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			headers := http.Header{"X-Client-Request-Id": []string{"shared-claude-code-header"}}
+			first, err := instance.interceptAfter(context.Background(), requestInterceptRequest{
+				SourceFormat: test.format, ToFormat: test.format, Model: "claude-opus-4-8",
+				Headers: headers, Body: []byte(`{"prompt":"inspect C:\\Users\\alice\\ann0.json"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = instance.interceptAfter(context.Background(), requestInterceptRequest{
+				SourceFormat: test.format, ToFormat: test.format, Model: "claude-opus-4-8",
+				Headers: headers, Body: []byte(`{"prompt":"inspect C:\\Users\\bob\\other.json"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := markerFromBody(t, first.Body)
+			split := len(marker) / 2
+			lookupKeys := correlationLookupKeys(headers, nil, [][]byte{first.Body}, "claude-opus-4-8")
+			instance.mu.Lock()
+			selected := instance.findSessionLocked(lookupKeys)
+			instance.mu.Unlock()
+			if selected == nil || selected.byMarker[marker].Marker != marker {
+				t.Fatalf("request-body lookup did not select first mapping: marker=%q keys=%v", marker, lookupKeys)
+			}
+			// CPA sends this initialization callback before the first SSE event.
+			instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+				SourceFormat: test.format, Model: "claude-opus-4-8", RequestHeaders: headers,
+				RequestBody: first.Body, ChunkIndex: -1,
+			})
+			firstOut := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+				SourceFormat: test.format, Model: "claude-opus-4-8", RequestHeaders: headers,
+				RequestBody: first.Body, Body: test.chunk(marker[:split], 0), ChunkIndex: 0,
+			})
+			if bytes.Contains(firstOut.Body, []byte(marker[:split])) {
+				t.Fatalf("partial marker leaked before completion: %s", firstOut.Body)
+			}
+			secondOut := instance.interceptStreamContext(context.Background(), streamChunkInterceptRequest{
+				SourceFormat: test.format, Model: "claude-opus-4-8", RequestHeaders: headers,
+				RequestBody: first.Body, Body: test.chunk(marker[split:], 1), ChunkIndex: 1,
+			})
+			if secondOut.DropChunk || bytes.Contains(secondOut.Body, []byte(marker)) || !bytes.Contains(secondOut.Body, []byte(`ann0.json`)) {
+				t.Fatalf("request-body correlation did not restore split marker: drop=%v body=%s", secondOut.DropChunk, secondOut.Body)
+			}
+			if bytes.Contains(secondOut.Body, []byte(`other.json`)) {
+				t.Fatalf("shared header selected the wrong request body session: %s", secondOut.Body)
+			}
+		})
+	}
+}
+
+func TestUnknownBundledEventsNeverBypassMarkerRecovery(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string) []byte
+	}{
+		{
+			name: "Claude", format: "claude",
+			chunk: func(marker string) []byte {
+				known := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n")
+				unknown := []byte("event: future_event\ndata: {\"type\":\"future_event\",\"payload\":{\"command\":\"" + marker + "\"}}\n\n")
+				return append(known, unknown...)
+			},
+		},
+		{
+			name: "OpenAI Chat", format: "openai",
+			chunk: func(marker string) []byte {
+				known := []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+				unknown := []byte("data: {\"event\":\"future_event\",\"payload\":{\"command\":\"" + marker + "\"}}\n\n")
+				return append(known, unknown...)
+			},
+		},
+		{
+			name: "Codex Responses", format: "openai-response",
+			chunk: func(marker string) []byte {
+				known := []byte("data: {\"type\":\"response.output_text.delta\",\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n")
+				unknown := []byte("data: {\"type\":\"response.future_event\",\"payload\":{\"command\":\"" + marker + "\"}}\n\n")
+				return append(known, unknown...)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newPrivacySession()
+			marker := session.newMarker("future-event")
+			session.addMapping(mapping{Marker: marker, Original: `private-project/ann0.json`})
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
+			output, drop, count := restorer.feed(test.chunk(marker))
+			if drop || count != 1 || bytes.Contains(output, []byte(marker)) || !bytes.Contains(output, []byte(`private-project/ann0.json`)) {
+				t.Fatalf("unknown bundled event leaked marker: drop=%v count=%d body=%s", drop, count, output)
+			}
+		})
+	}
+}
+
+func TestUnknownStreamEventsCarrySplitMarkersForAllProtocols(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		chunk  func(string) []byte
+	}{
+		{
+			name: "Claude", format: "claude",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "future_event", "index": 0, "payload": map[string]any{"command": value}})
+				return append(append([]byte("event: future_event\ndata: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "OpenAI Chat", format: "openai",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"event": "future_event", "index": 0, "payload": map[string]any{"command": value}})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+		{
+			name: "Codex Responses", format: "openai-response",
+			chunk: func(value string) []byte {
+				event, _ := json.Marshal(map[string]any{"type": "response.future_event", "item_id": "item-1", "output_index": 0, "payload": map[string]any{"command": value}})
+				return append(append([]byte("data: "), event...), []byte("\n\n")...)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newPrivacySession()
+			marker := markerPrefix + "AAAAAAAABBBBC"
+			session.addMapping(mapping{Marker: marker, Original: "private-project/ann0.json"})
+			restorer := &streamRestorer{session: session, adapter: adapterForFormat(test.format)}
+			split := len(marker) / 2
+
+			first, firstDrop, firstCount := restorer.feed(test.chunk(marker[:split]))
+			if firstDrop || firstCount != 0 || bytes.Contains(first, []byte(marker[:split])) {
+				t.Fatalf("unknown event leaked an incomplete marker: drop=%v count=%d body=%s", firstDrop, firstCount, first)
+			}
+			second, secondDrop, secondCount := restorer.feed(test.chunk(marker[split:]))
+			if secondDrop || secondCount != 1 || bytes.Contains(second, []byte(marker)) || !bytes.Contains(second, []byte("private-project/ann0.json")) {
+				t.Fatalf("unknown event did not restore its split marker: drop=%v count=%d body=%s", secondDrop, secondCount, second)
+			}
+		})
 	}
 }
 

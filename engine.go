@@ -18,6 +18,8 @@ import (
 
 const cpaRequestIDMetadataKey = "cpa_request_id"
 
+const privateSessionKeyPrefix = "session-"
+
 // Keep the historical internal names as aliases so the protocol-neutral core
 // and its tests remain stable while the CPA boundary is compiler-checked
 // against the official SDK.
@@ -191,7 +193,7 @@ func (e *engine) interceptStreamContext(ctx context.Context, request streamChunk
 	})
 	if restorer != nil && restorer.streamTerminal(request.Body) {
 		e.mu.Lock()
-		e.deleteSessionLocked(restorer.session)
+		e.releaseSessionAliasesLocked(restorer.session)
 		e.mu.Unlock()
 	}
 	return streamChunkInterceptResponse{Body: body, DropChunk: drop}
@@ -220,7 +222,7 @@ func (e *engine) storeSession(session *privacySession, keys ...string) {
 	// aliases. A later request may overwrite a shared X-Client-Request-Id alias;
 	// retaining this entry lets a response marker resolve the older session.
 	e.nextSessionKey++
-	e.sessions["session-"+strconv.FormatUint(e.nextSessionKey, 10)] = entry
+	e.sessions[privateSessionKeyPrefix+strconv.FormatUint(e.nextSessionKey, 10)] = entry
 	for _, key := range keys {
 		if key != "" {
 			e.sessions[key] = entry
@@ -237,7 +239,7 @@ func (e *engine) takeSession(keys []string, remove bool, markerPayloads ...[]byt
 		return nil
 	}
 	if remove {
-		e.deleteSessionLocked(session)
+		e.releaseSessionAliasesLocked(session)
 	}
 	return session
 }
@@ -249,6 +251,15 @@ func (e *engine) ensureStream(streamKeys, sessionKeys []string, format string, m
 	session := e.findSessionLocked(sessionKeys, markerPayloads...)
 	if session == nil {
 		return nil
+	}
+	// Prefer the stream state bound to this exact request key. A session can have
+	// several aliases (body hashes, headers, retained marker cache); iterating
+	// the map first can select another alias' restorer and lose a split marker's
+	// field-local buffer between consecutive deltas.
+	for _, key := range streamKeys {
+		if stream := e.streams[key]; stream != nil && stream.session == session {
+			return stream
+		}
 	}
 	// A client request header is only a compatibility alias and may be shared by
 	// concurrent Agent requests. Resolve the strong request-scoped session first,
@@ -345,6 +356,28 @@ func (e *engine) deleteSessionLocked(session *privacySession) {
 	}
 	for key, entry := range e.sessions {
 		if entry.session == session {
+			delete(e.sessions, key)
+		}
+	}
+	for key, stream := range e.streams {
+		if stream != nil && stream.session == session {
+			delete(e.streams, key)
+		}
+	}
+}
+
+// releaseSessionAliasesLocked finishes one response without discarding its
+// bounded mapping cache. A marker that escaped once can be replayed by an
+// agent in a later conversation turn; the private entry remains available for
+// marker-based recovery until the configured TTL or max-session eviction.
+// Request headers and stream bindings are deliberately removed because they
+// are request-local aliases and may be reused by another Agent turn.
+func (e *engine) releaseSessionAliasesLocked(session *privacySession) {
+	if session == nil {
+		return
+	}
+	for key, entry := range e.sessions {
+		if entry.session == session && !strings.HasPrefix(key, privateSessionKeyPrefix) {
 			delete(e.sessions, key)
 		}
 	}
@@ -455,31 +488,40 @@ func correlationLookupKeys(headers http.Header, metadata map[string]any, bodies 
 			add(strings.TrimSpace(value))
 		}
 	}
-	for _, key := range requestHeaderLookupKeys(headers) {
+	for _, key := range sessionLookupKeys(nil, bodies, models...) {
 		add(key)
 	}
-	for _, key := range sessionLookupKeys(nil, bodies, models...) {
+	for _, key := range requestHeaderLookupKeys(headers) {
 		add(key)
 	}
 	return keys
 }
 
 func correlationStoreKeys(headers http.Header, metadata map[string]any, bodies [][]byte, models ...string) []string {
-	keys := make([]string, 0, 1+len(requestHeaderLookupKeys(headers)))
+	keys := make([]string, 0, 1+len(requestHeaderLookupKeys(headers))+len(bodies)*(1+len(models)))
+	seen := make(map[string]struct{}, cap(keys))
+	add := func(key string) {
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
 	if metadata != nil {
 		if value, ok := metadata[cpaRequestIDMetadataKey].(string); ok {
-			if key := strings.TrimSpace(value); key != "" {
-				keys = append(keys, key)
-			}
+			add(strings.TrimSpace(value))
 		}
 	}
-	if headerKeys := requestHeaderLookupKeys(headers); len(headerKeys) != 0 {
-		keys = append(keys, headerKeys[0])
+	for _, key := range sessionLookupKeys(nil, bodies, models...) {
+		add(key)
 	}
-	if len(keys) != 0 {
-		return keys
+	for _, key := range requestHeaderLookupKeys(headers) {
+		add(key)
 	}
-	return sessionLookupKeys(nil, bodies, models...)
+	return keys
 }
 
 func requestHeaderLookupKeys(headers http.Header) []string {

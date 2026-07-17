@@ -106,7 +106,14 @@ func (codexAdapter) RestoreStreamChunk(body []byte, restorer *contentStreamResto
 
 func restoreKnownStreamChunk(body []byte, restorer *contentStreamRestorer) ([]byte, bool, int) {
 	if updated, handled, count := restoreSSEJSONChunk(body, func(event map[string]any) (bool, int) {
-		return restoreKnownStreamEvent(event, restorer)
+		if handled, count := restoreKnownStreamEvent(event, restorer); handled {
+			return true, count
+		}
+		// Keep an independent carry buffer for every string in an unrecognised
+		// event. This is deliberately event-local rather than a whole-chunk
+		// fallback: a future event can split a marker across valid SSE frames,
+		// just like the recognised text and tool-argument deltas do.
+		return restoreGenericStreamEvent(event, restorer)
 	}); handled {
 		return updated, true, count
 	}
@@ -119,6 +126,9 @@ func restoreKnownStreamChunk(body []byte, restorer *contentStreamRestorer) ([]by
 	}
 	handled, count := restoreKnownStreamEvent(event, restorer)
 	if !handled {
+		handled, count = restoreGenericStreamEvent(event, restorer)
+	}
+	if !handled {
 		return body, false, 0
 	}
 	updated, err := json.Marshal(event)
@@ -126,6 +136,99 @@ func restoreKnownStreamChunk(body []byte, restorer *contentStreamRestorer) ([]by
 		return body, false, 0
 	}
 	return updated, true, count
+}
+
+// restoreGenericStreamEvent is the compatibility path for a complete JSON
+// event which is not one of the provider shapes explicitly named above. It
+// never performs a raw-byte scan over the callback. Instead, it gives every
+// eligible string leaf its own stable carry-buffer key, so a split marker is
+// withheld until the following event supplies the rest of it.
+func restoreGenericStreamEvent(event map[string]any, restorer *contentStreamRestorer) (bool, int) {
+	if restorer == nil {
+		return false, 0
+	}
+	scope := genericStreamEventScope(event)
+	_, handled, count := restoreGenericStreamValue(event, restorer, scope, "", "$", payloadNone)
+	return handled, count
+}
+
+func genericStreamEventScope(event map[string]any) string {
+	kind := ""
+	for _, field := range []string{"type", "event"} {
+		if value, ok := event[field].(string); ok && strings.TrimSpace(value) != "" {
+			kind = strings.ToLower(strings.TrimSpace(value))
+			break
+		}
+	}
+	if kind == "" {
+		kind = "unknown"
+	}
+	parts := []string{"generic", kind}
+	for _, field := range []string{"id", "item_id", "call_id", "index", "output_index", "content_index"} {
+		if value := streamValueKey(event[field], -1); value != "-1" {
+			parts = append(parts, field+"="+value)
+		}
+	}
+	return strings.Join(parts, ":")
+}
+
+func restoreGenericStreamValue(value any, restorer *contentStreamRestorer, scope, containerField, path string, mode payloadMode) (any, bool, int) {
+	switch node := value.(type) {
+	case map[string]any:
+		protocolNode := mode == payloadProtocolContent && isProtocolContentBlock(node)
+		if mode != payloadArbitrary && (mode == payloadNone || protocolNode) && isOpaqueProtocolBlock(node) {
+			return node, false, 0
+		}
+		keys := make([]string, 0, len(node))
+		for key := range node {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		handled, count := false, 0
+		for _, key := range keys {
+			child := node[key]
+			protocolSemantics := mode == payloadNone || protocolNode
+			if protocolSemantics && (isOpaqueProtocolValue(node, key) || isProtocolStructuralValue(key, redactionTraversal{payload: mode}, protocolNode)) {
+				continue
+			}
+			childMode := nextPayloadMode(node, key, child, mode, protocolNode)
+			childPath := appendJSONPath(path, key)
+			if text, ok := child.(string); ok {
+				fieldKey := scope + ":" + childPath
+				var restored string
+				var childCount int
+				if isEmbeddedJSONStringValue(node, containerField, key, mode, protocolNode) {
+					restored, childCount = restorer.feedJSONString(fieldKey, text)
+				} else {
+					restored, childCount = restorer.feed(fieldKey, text)
+				}
+				node[key] = restored
+				handled = true
+				count += childCount
+				continue
+			}
+			restored, childHandled, childCount := restoreGenericStreamValue(child, restorer, scope, key, childPath, childMode)
+			node[key] = restored
+			handled = handled || childHandled
+			count += childCount
+		}
+		return node, handled, count
+	case []any:
+		handled, count := false, 0
+		for index, child := range node {
+			childPath := fmt.Sprintf("%s/%d", path, index)
+			restored, childHandled, childCount := restoreGenericStreamValue(child, restorer, scope, containerField, childPath, mode)
+			node[index] = restored
+			handled = handled || childHandled
+			count += childCount
+		}
+		return node, handled, count
+	case string:
+		restored, count := restorer.feed(scope+":"+path, node)
+		return restored, true, count
+	default:
+		return value, false, 0
+	}
 }
 
 const maxClaudeThinkingBufferBytes = 1024 * 1024
@@ -231,7 +334,17 @@ func restoreClaudeStreamChunk(body []byte, restorer *contentStreamRestorer) ([]b
 			totalCount += count
 			output = appendStreamFrame(output, updated)
 		} else {
-			output = appendStreamFrame(output, frame)
+			// Do not let a future/translated Claude event leak merely because a
+			// different frame in this callback was handled. restoreJSONBytes uses
+			// JSON-string escaping for raw SSE input, so paths remain valid JSON.
+			updated, count := restoreJSONBytes(frame, restorer.session)
+			if count > 0 {
+				handledAny = true
+				totalCount += count
+				output = appendStreamFrame(output, updated)
+			} else {
+				output = appendStreamFrame(output, frame)
+			}
 		}
 	}
 	if !handledAny {
@@ -461,8 +574,11 @@ func restoreCodexStreamEvent(event map[string]any, restorer *contentStreamRestor
 		return false, 0
 	}
 	if !strings.Contains(eventType, ".delta") {
-		_, count := restoreJSONValue(event, "", restorer.session)
-		return true, count
+		// Completion and provider-extension events are JSON events too. Keep
+		// their string leaves on the same field-local streaming path instead of
+		// doing a one-shot replacement, otherwise a marker split across two
+		// response.* events leaks its first half.
+		return restoreGenericStreamEvent(event, restorer)
 	}
 	key := strings.Join([]string{
 		eventType,
